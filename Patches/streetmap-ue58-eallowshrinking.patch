@@ -1,0 +1,4 @@
+# UE 5.8 port: TArray::SetNum(count, bool) -> SetNum(count, EAllowShrinking)
+# Apply to Plugins/StreetMap after CMake fetches it:
+#   sed -i 's/\.SetNum( \(.*\), false )/.SetNum( \1, EAllowShrinking::No )/' \
+#     Source/StreetMapRuntime/Private/StreetMapComponent.cpp
