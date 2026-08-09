@@ -36,11 +36,16 @@ AAirGroundGameMode::AAirGroundGameMode(
     ActorFactories.Add(VehicleFactory.Class);
   }
 
-  // Walkers stay unregistered until the pedestrian animations are upgraded:
-  // CARLA's content is authored for UE 5.5 and Anim_Death_B_01 fails 5.8's
-  // AnimSequenceBase data-model check at load time, killing the process.
-  // Re-save Content/Carla/Animations with the editor's resave commandlet,
-  // then restore this factory.
+  // Pedestrian animations were authored for UE 5.5 and originally failed 5.8's
+  // AnimSequenceBase data-model check at load time, taking the process with
+  // them. Content/Carla/Animations has since been re-saved by the editor's
+  // ResavePackages commandlet, which is what makes this factory safe to load.
+  static ConstructorHelpers::FClassFinder<ACarlaActorFactory>
+      WalkerFactory(TEXT("/Game/Carla/Blueprints/Walkers/BP_WalkerFactory"));
+  if (WalkerFactory.Succeeded())
+  {
+    ActorFactories.Add(WalkerFactory.Class);
+  }
 
   static ConstructorHelpers::FClassFinder<ACarlaActorFactory>
       PropFactory(TEXT("/Game/Carla/Blueprints/Props/BP_PropFactory"));
