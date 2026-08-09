@@ -1,7 +1,10 @@
 #include "AirGroundGameMode.h"
 
+#include "EngineUtils.h"
 #include "Misc/Paths.h"
 #include "UObject/ConstructorHelpers.h"
+
+#include "Carla/Actor/ActorDescription.h"
 
 #include "Carla/AI/AIControllerFactory.h"
 #include "Carla/Actor/CarlaActorFactory.h"
@@ -61,6 +64,41 @@ void AAirGroundGameMode::StartPlay()
   Super::StartPlay();
 
   SimLoader.LaunchSimulation(GetWorld());
+}
+
+void AAirGroundGameMode::Tick(float DeltaSeconds)
+{
+  Super::Tick(DeltaSeconds);
+  TryRegisterAirRobots();
+}
+
+void AAirGroundGameMode::TryRegisterAirRobots()
+{
+  for (TActorIterator<AActor> It(GetWorld()); It; ++It)
+  {
+    AActor *Actor = *It;
+    // Matched by class name rather than type: UnrealRobot lives in the
+    // ProjectAirSim plugin's Private folder, and depending on its headers
+    // here would couple the bridge to that plugin's internals.
+    if (Actor == nullptr ||
+        !Actor->GetClass()->GetName().Contains(TEXT("UnrealRobot")) ||
+        RegisteredAirRobots.Contains(Actor))
+    {
+      continue;
+    }
+
+    FActorDescription Description;
+    Description.Id = TEXT("airground.quadrotor");
+    Description.Class = Actor->GetClass();
+
+    if (RegisterExternalActor(*Actor, Description) != nullptr)
+    {
+      RegisteredAirRobots.Add(Actor);
+      UE_LOG(LogTemp, Log,
+             TEXT("AirGroundBridge: registered '%s' with CARLA as '%s'"),
+             *Actor->GetName(), *Description.Id);
+    }
+  }
 }
 
 void AAirGroundGameMode::EndPlay(const EEndPlayReason::Type EndPlayReason)
