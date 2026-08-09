@@ -4,7 +4,7 @@
 #include "UObject/ConstructorHelpers.h"
 
 #include "Carla/AI/AIControllerFactory.h"
-#include "Carla/Actor/CarlaActorFactoryBlueprint.h"
+#include "Carla/Actor/CarlaActorFactory.h"
 #include "Carla/Actor/StaticMeshFactory.h"
 #include "Carla/Actor/UtilActorFactory.h"
 #include "Carla/Sensor/SensorFactory.h"
@@ -26,7 +26,7 @@ AAirGroundGameMode::AAirGroundGameMode(
   ActorFactories.Add(AUtilActorFactory::StaticClass());
   ActorFactories.Add(AAIControllerFactory::StaticClass());
 
-  static ConstructorHelpers::FClassFinder<ACarlaActorFactoryBlueprint>
+  static ConstructorHelpers::FClassFinder<ACarlaActorFactory>
       VehicleFactory(TEXT("/Game/Carla/Blueprints/Vehicles/BP_VehicleFactory"));
   if (VehicleFactory.Succeeded())
   {
@@ -39,7 +39,7 @@ AAirGroundGameMode::AAirGroundGameMode(
   // Re-save Content/Carla/Animations with the editor's resave commandlet,
   // then restore this factory.
 
-  static ConstructorHelpers::FClassFinder<ACarlaActorFactoryBlueprint>
+  static ConstructorHelpers::FClassFinder<ACarlaActorFactory>
       PropFactory(TEXT("/Game/Carla/Blueprints/Props/BP_PropFactory"));
   if (PropFactory.Succeeded())
   {

@@ -30,6 +30,10 @@
 			"Enabled": true
 		},
 		{
+			"Name": "Drone",
+			"Enabled": true
+		},
+		{
 			"Name": "AirGroundBridge",
 			"Enabled": true
 		},
