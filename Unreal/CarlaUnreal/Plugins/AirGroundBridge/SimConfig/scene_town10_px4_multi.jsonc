@@ -1,0 +1,26 @@
+{
+  "id": "SceneTown10PX4Multi",
+  "actors": [
+    {
+      "type": "robot",
+      "name": "Drone1",
+      // Spawned 10 m apart so the two airframes cannot be confused with each
+      // other in ground truth, and so their PX4 instances stay independent.
+      "origin": { "xyz": "25.0 0.0 -1.5", "rpy-deg": "0 0 0" },
+      "robot-config": "robot_quadrotor_px4_sitl.jsonc"
+    },
+    {
+      "type": "robot",
+      "name": "Drone2",
+      "origin": { "xyz": "25.0 10.0 -1.5", "rpy-deg": "0 0 0" },
+      "robot-config": "robot_quadrotor_px4_sitl_2.jsonc"
+    }
+  ],
+  "clock": { "type": "steppable", "step-ns": 3000000,
+             "real-time-update-rate": 3000000, "pause-on-start": false },
+  "home-geo-point": { "latitude": 47.641468, "longitude": -122.140165,
+                      "altitude": 122.0 },
+  "segmentation": { "initialize-ids": true, "ignore-existing": false,
+                    "use-owner-name": true },
+  "scene-type": "UnrealNative"
+}
