@@ -137,6 +137,17 @@ protected:
 
   void Tick(float DeltaSeconds) override;
 
+  /// Register an actor this game mode did not spawn - e.g. one created by
+  /// another simulator sharing the same world - so clients see it in the
+  /// episode's registry. UCarlaEpisode befriends this class but friendship
+  /// does not extend to subclasses, so the access is forwarded here.
+  FCarlaActor *RegisterExternalActor(AActor &Actor, FActorDescription Description)
+  {
+    return (Episode != nullptr)
+        ? Episode->ActorDispatcher->RegisterActor(Actor, std::move(Description))
+        : nullptr;
+  }
+
 private:
 
   void SpawnActorFactories();
