@@ -36,16 +36,14 @@ AAirGroundGameMode::AAirGroundGameMode(
     ActorFactories.Add(VehicleFactory.Class);
   }
 
-  // Pedestrian animations were authored for UE 5.5 and originally failed 5.8's
-  // AnimSequenceBase data-model check at load time, taking the process with
-  // them. Content/Carla/Animations has since been re-saved by the editor's
-  // ResavePackages commandlet, which is what makes this factory safe to load.
-  static ConstructorHelpers::FClassFinder<ACarlaActorFactory>
-      WalkerFactory(TEXT("/Game/Carla/Blueprints/Walkers/BP_WalkerFactory"));
-  if (WalkerFactory.Succeeded())
-  {
-    ActorFactories.Add(WalkerFactory.Class);
-  }
+  // Walkers stay unregistered: Anim_Death_B_01 aborts on load under UE 5.8
+  // with "no data model found past upgrade object version", taking the process
+  // with it. A ResavePackages pass over Content/Carla/Animations rewrote all 72
+  // assets and rebuilt their compressed data, but the source data model is
+  // simply absent in the shipped content, so the resave has nothing to restore
+  // and the crash is unchanged. Fixing this needs animation content that
+  // carries a data model - re-imported from source, or from a CARLA content
+  // release built against UE 5.8 - not another resave.
 
   static ConstructorHelpers::FClassFinder<ACarlaActorFactory>
       PropFactory(TEXT("/Game/Carla/Blueprints/Props/BP_PropFactory"));
