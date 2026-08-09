@@ -15,7 +15,10 @@ public class AirGroundBridge : ModuleRules
             new string[] { "Core", "CoreUObject", "Engine" });
 
         PrivateDependencyModuleNames.AddRange(
-            new string[] { "Carla", "ProjectAirSim", "RenderCore", "RHI" });
+            new string[] { "Carla", "ProjectAirSim", "RenderCore", "RHI",
+                // Carla keeps these private, but its public headers
+                // (CarlaEpisode -> ActorData -> WheelPhysicsControl) need them.
+                "Chaos", "ChaosVehicles", "PhysicsCore" });
 
         // ProjectAirSim only exports Source/ProjectAirSim/Public, but its public
         // UnrealSimLoader.h pulls headers from Private/ and from the SimLibs

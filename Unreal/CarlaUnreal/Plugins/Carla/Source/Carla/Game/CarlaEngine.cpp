@@ -15,6 +15,10 @@
 #include "Carla/Settings/EpisodeSettings.h"
 #include "Carla/MapGen/LargeMapManager.h"
 
+#include "Engine/Engine.h"
+#include "Engine/GameViewportClient.h"
+#include "SceneInterface.h"
+
 #include <util/disable-ue4-macros.h>
 #include <carla/Logging.h>
 #include <carla/multigpu/primaryCommands.h>
