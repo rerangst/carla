@@ -171,6 +171,11 @@ private:
   UPROPERTY()
   UObjectRegister* ObjectRegister = nullptr;
 
+  // Configuration a C++ subclass must be able to fill in: a subclass inherits
+  // the class but not BP_CarlaGameMode's property values, so leaving these
+  // private leaves such a game mode with no factories and no weather.
+protected:
+
   /// The class of Weather to spawn.
   UPROPERTY(Category = "CARLA Game Mode", EditAnywhere)
   TSubclassOf<AWeather> WeatherClass;
@@ -179,6 +184,8 @@ private:
   /// available in game.
   UPROPERTY(Category = "CARLA Game Mode", EditAnywhere)
   TSet<TSubclassOf<ACarlaActorFactory>> ActorFactories;
+
+private:
 
   UPROPERTY()
   TArray<FTransform> SpawnPointsTransforms;
