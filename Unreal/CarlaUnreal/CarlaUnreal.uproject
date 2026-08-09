@@ -26,6 +26,14 @@
 			"Enabled": true
 		},
 		{
+			"Name": "ProjectAirSim",
+			"Enabled": true
+		},
+		{
+			"Name": "AirGroundBridge",
+			"Enabled": true
+		},
+		{
 			"Name": "RenderDocPlugin",
 			"Enabled": true
 		},

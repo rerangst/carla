@@ -1,0 +1,23 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.1.0",
+  "FriendlyName": "AirGroundBridge",
+  "Description": "Fuses CARLA (ground world) and ProjectAirSim (UAV + PX4) into one UE 5.8 process via a combined GameMode.",
+  "Category": "Simulation",
+  "CreatedBy": "AirGround Sim project",
+  "EnabledByDefault": true,
+  "CanContainContent": false,
+  "Installed": true,
+  "Modules": [
+    {
+      "Name": "AirGroundBridge",
+      "Type": "Runtime",
+      "LoadingPhase": "PostConfigInit"
+    }
+  ],
+  "Plugins": [
+    { "Name": "Carla", "Enabled": true },
+    { "Name": "ProjectAirSim", "Enabled": true }
+  ]
+}
