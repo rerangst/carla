@@ -36,14 +36,23 @@ AAirGroundGameMode::AAirGroundGameMode(
     ActorFactories.Add(VehicleFactory.Class);
   }
 
-  // Walkers stay unregistered: Anim_Death_B_01 aborts on load under UE 5.8
-  // with "no data model found past upgrade object version", taking the process
-  // with it. A ResavePackages pass over Content/Carla/Animations rewrote all 72
-  // assets and rebuilt their compressed data, but the source data model is
-  // simply absent in the shipped content, so the resave has nothing to restore
-  // and the crash is unchanged. Fixing this needs animation content that
-  // carries a data model - re-imported from source, or from a CARLA content
-  // release built against UE 5.8 - not another resave.
+  // Walkers stay unregistered: CARLA's pedestrian animations abort on load
+  // under UE 5.8 with "no data model found past upgrade object version",
+  // taking the process with it.
+  //
+  // Two fixes were tried and both failed, so neither is worth repeating:
+  //   * ResavePackages over Content/Carla/Animations rewrote all 72 assets
+  //     (package version 1013 -> 1018, zero save failures) and rebuilt their
+  //     compressed data. The crash was unchanged: a resave rewrites what is in
+  //     memory, and the source data model is absent from the shipped content,
+  //     so there is nothing to restore.
+  //   * Moving the Death_Anim folder aside only advanced the crash to
+  //     Animations/Depot/man_xfull_Anim. The defect is spread across the
+  //     animation set, not isolated to one asset, so deleting offenders one at
+  //     a time is not a path to working pedestrians.
+  //
+  // This needs animation content that carries a data model - re-imported from
+  // source, or a CARLA content release built against UE 5.8.
 
   static ConstructorHelpers::FClassFinder<ACarlaActorFactory>
       PropFactory(TEXT("/Game/Carla/Blueprints/Props/BP_PropFactory"));
