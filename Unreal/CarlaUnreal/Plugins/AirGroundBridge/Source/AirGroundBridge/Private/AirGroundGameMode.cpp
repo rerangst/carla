@@ -1,4 +1,5 @@
 #include "AirGroundGameMode.h"
+#include "ReconTwin.h"
 
 #include "EngineUtils.h"
 #include "Misc/Paths.h"
@@ -74,6 +75,10 @@ void AAirGroundGameMode::StartPlay()
   // CARLA first: episode and dispatcher must exist before any robot spawned
   // by PAS can later be registered with them.
   Super::StartPlay();
+
+  // A scanned site, when one is named on the command line, goes in before
+  // ProjectAirSim starts so its collision exists by the time the sim serves.
+  FReconTwinLoader::LoadFromCommandLine(GetWorld());
 
   SimLoader.LaunchSimulation(GetWorld());
 }

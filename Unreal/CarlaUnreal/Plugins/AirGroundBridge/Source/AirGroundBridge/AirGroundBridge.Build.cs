@@ -16,6 +16,8 @@ public class AirGroundBridge : ModuleRules
 
         PrivateDependencyModuleNames.AddRange(
             new string[] { "Carla", "ProjectAirSim", "RenderCore", "RHI",
+                // ReconTwin: twin.jsonc manifest + runtime collision tiles.
+                "Json", "ProceduralMeshComponent",
                 // Carla keeps these private, but its public headers
                 // (CarlaEpisode -> ActorData -> WheelPhysicsControl) need them.
                 "Chaos", "ChaosVehicles", "PhysicsCore", "Foliage" });

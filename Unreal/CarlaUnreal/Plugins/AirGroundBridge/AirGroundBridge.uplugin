@@ -18,6 +18,7 @@
   ],
   "Plugins": [
     { "Name": "Carla", "Enabled": true },
-    { "Name": "ProjectAirSim", "Enabled": true }
+    { "Name": "ProjectAirSim", "Enabled": true },
+    { "Name": "ProceduralMeshComponent", "Enabled": true }
   ]
 }
