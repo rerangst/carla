@@ -22,6 +22,8 @@ public class AirGroundBridge : ModuleRules
                 // global shaders (Renderer for FViewInfo and the post-process
                 // inputs, Projects to find the plugin's Shaders/ directory).
                 "Renderer", "Projects",
+                // AgExec: the loopback UDP console.
+                "Sockets", "Networking",
                 // Carla keeps these private, but its public headers
                 // (CarlaEpisode -> ActorData -> WheelPhysicsControl) need them.
                 "Chaos", "ChaosVehicles", "PhysicsCore", "Foliage" });

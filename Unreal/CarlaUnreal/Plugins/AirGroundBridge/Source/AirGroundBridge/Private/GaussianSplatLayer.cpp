@@ -11,6 +11,7 @@
 #include "HAL/PlatformFileManager.h"
 #include "GenericPlatform/GenericPlatformFile.h"
 #include "Misc/FileHelper.h"
+#include "Misc/ScopeLock.h"
 #include "PipelineStateCache.h"
 #include "PixelShaderUtils.h"
 #include "PostProcess/PostProcessInputs.h"
@@ -258,6 +259,19 @@ public:
 
   int32 LodLogsLeft = 6; // first picks are logged regardless of ag.Splat.LogLod
 
+  // Last pick of every view size, for ag.Splat.Stats (written by the render
+  // thread, read by the console on the game thread).
+  struct FPick
+  {
+    uint32 Width = 0, Height = 0;
+    bool bCapture = false;
+    uint32 Cells = 0, Splats = 0, Sky = 0, Capacity = 0;
+    float Tau = 0.0f;
+    double At = 0.0;
+  };
+  FCriticalSection PicksLock;
+  TArray<FPick> Picks;
+
   // Sort verification, render thread only.
   TUniquePtr<FRHIGPUBufferReadback> SortReadback;
   TUniquePtr<FRHIGPUBufferReadback> KeyReadback; // before the sort
@@ -266,6 +280,32 @@ public:
 };
 
 TSharedPtr<FGaussianSplatSceneViewExtension, ESPMode::ThreadSafe> GSplatExtension;
+
+// ag.Splat.Stats: one line per view size with its last LOD pick. The web
+// view polls this (through -AgExecPort) to show how many splats its camera
+// draws at the current ag.Splat.LodPixels.
+void PrintSplatStats(FOutputDevice &Ar)
+{
+  const TSharedPtr<FGaussianSplatSceneViewExtension, ESPMode::ThreadSafe> Ext = GSplatExtension;
+  if (!Ext.IsValid() || Ext->NumSplats.load() == 0)
+  {
+    Ar.Logf(TEXT("no splat layer loaded"));
+    return;
+  }
+  const double Now = FPlatformTime::Seconds();
+  FScopeLock Lock(&Ext->PicksLock);
+  Ar.Logf(TEXT("loaded=%d lodpixels=%.2f"), Ext->NumSplats.load(), CVarSplatLodPixels.GetValueOnGameThread());
+  for (const FGaussianSplatSceneViewExtension::FPick &P : Ext->Picks)
+  {
+    Ar.Logf(TEXT("view %ux%u %s splats=%u sky=%u cells=%u px=%.2f capacity=%u age=%.1f"), P.Width, P.Height,
+            P.bCapture ? TEXT("capture") : TEXT("main"), P.Splats, P.Sky, P.Cells, P.Tau, P.Capacity, Now - P.At);
+  }
+}
+
+FAutoConsoleCommandWithOutputDevice GSplatStatsCommand(
+    TEXT("ag.Splat.Stats"),
+    TEXT("Print the last LOD pick of every view size: splats, sky, cells, pixel threshold, capacity, age (s)."),
+    FConsoleCommandWithOutputDeviceDelegate::CreateStatic(&PrintSplatStats));
 
 void FGaussianSplatSceneViewExtension::PrePostProcessPass_RenderThread(
     FRDGBuilder &GraphBuilder, const FSceneView &InView, const FPostProcessingInputs &Inputs)
@@ -351,6 +391,29 @@ void FGaussianSplatSceneViewExtension::PrePostProcessPass_RenderThread(
            TEXT("GaussianSplat: view %s at (%.0f %.0f %.0f) cm, focal %.0f px: %u cells, %u splats (+%u sky) at %.2f px, budget %u"),
            View.bIsSceneCapture ? TEXT("capture") : TEXT("main"), CameraPos.X, CameraPos.Y, CameraPos.Z, FocalPx,
            CellsPicked, Selected - (bNoEnv ? 0u : Res->EnvCount), bNoEnv ? 0u : Res->EnvCount, Tau, Res->Capacity);
+  }
+  {
+    const uint32 W = View.ViewRect.Width(), H = View.ViewRect.Height();
+    FScopeLock Lock(&PicksLock);
+    FPick *Pick = Picks.FindByPredicate(
+        [&](const FPick &P) { return P.Width == W && P.Height == H && P.bCapture == View.bIsSceneCapture; });
+    if (Pick == nullptr)
+    {
+      if (Picks.Num() >= 8)
+      {
+        Picks.RemoveAt(0);
+      }
+      Pick = &Picks.AddDefaulted_GetRef();
+      Pick->Width = W;
+      Pick->Height = H;
+      Pick->bCapture = View.bIsSceneCapture;
+    }
+    Pick->Cells = CellsPicked;
+    Pick->Splats = Selected - (bNoEnv ? 0u : Res->EnvCount);
+    Pick->Sky = bNoEnv ? 0u : Res->EnvCount;
+    Pick->Capacity = Res->Capacity;
+    Pick->Tau = Tau;
+    Pick->At = FPlatformTime::Seconds();
   }
   const uint32 Count = Selected;
   FRDGBufferRef RangesBuffer = CreateStructuredBuffer(
