@@ -1,6 +1,13 @@
 #include "ReconTwin.h"
 
+#include "Components/DirectionalLightComponent.h"
+#include "Components/SkyAtmosphereComponent.h"
+#include "Components/SkyLightComponent.h"
 #include "Dom/JsonObject.h"
+#include "Engine/DirectionalLight.h"
+#include "Engine/SkyLight.h"
+#include "EngineUtils.h"
+#include "Materials/MaterialInterface.h"
 #include "Misc/CommandLine.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
@@ -14,17 +21,62 @@ DEFINE_LOG_CATEGORY_STATIC(LogReconTwin, Log, All);
 
 namespace crp = carla::rpc;
 
-// LCC2 is right-handed, metres, (x east, y north, z up) in its UTM zone. The
+// LCC2 is right-handed, metres, (x east, y north, z up) on its UTM grid. The
 // twin's GPS goes through ProjectAirSim, whose NED->UE mapping is
 // (north, east, -down) -> (X, Y, Z) (UnrealHelpers::ToFVectorTranslation), so
-// north must land on +X and east on +Y: swap x and y, metres to cm.
-// Swapping two axes is a reflection, which flips the sign of every cross
+// true north must land on +X and east on +Y. Grid north is not true north
+// (grid convergence, about 1 deg at this sample's longitude) and a grid metre
+// is not a ground metre (scale factor), so the manifest carries a 2x2 matrix
+// from grid (east, north) to true (north, east), computed by
+// tools/make_twin_package.py; without it the axes are simply swapped.
+// Either way the map is a reflection, which flips the sign of every cross
 // product; UE's own face normal is (P1-P2)x(P0-P2), the negative of the
 // right-handed rule. The two flips cancel, so the original index order is
 // kept and normals come out facing outward.
-static FVector ToUnreal(const FVector3f &P)
+struct FGridToTrue
 {
-  return FVector(P.Y * 100.0, P.X * 100.0, P.Z * 100.0);
+  double NorthOfEast = 0.0, NorthOfNorth = 1.0;
+  double EastOfEast = 1.0, EastOfNorth = 0.0;
+
+  FVector ToUnreal(const FVector3f &P) const
+  {
+    const double North = NorthOfEast * P.X + NorthOfNorth * P.Y;
+    const double East = EastOfEast * P.X + EastOfNorth * P.Y;
+    return FVector(North * 100.0, East * 100.0, P.Z * 100.0);
+  }
+};
+
+/// CARLA's empty test level has no light at all; a twin loaded there would
+/// render black. Only added when the level brings none of its own.
+static void EnsureLighting(UWorld *World)
+{
+  for (TActorIterator<ADirectionalLight> It(World); It; ++It)
+  {
+    UE_LOG(LogReconTwin, Display, TEXT("ReconTwin: level lights itself (%s at %.0f lux)"),
+           *It->GetName(), It->GetLightComponent()->Intensity);
+    return;
+  }
+  ADirectionalLight *Sun = World->SpawnActor<ADirectionalLight>(
+      FVector::ZeroVector, FRotator(-50.0f, 35.0f, 0.0f));
+  if (Sun != nullptr)
+  {
+    Sun->SetMobility(EComponentMobility::Movable);
+    if (UDirectionalLightComponent *Light = Cast<UDirectionalLightComponent>(Sun->GetLightComponent()))
+    {
+      // CARLA's cameras auto-expose within a bounded EV range, tuned for a
+      // real sun; UE's own SunSky uses 75000 lux, 2000 lux renders as dusk.
+      Light->SetIntensity(75000.0f);
+      Light->SetAtmosphereSunLight(true);
+    }
+  }
+  World->SpawnActor<ASkyAtmosphere>();
+  ASkyLight *Sky = World->SpawnActor<ASkyLight>();
+  if (Sky != nullptr)
+  {
+    Sky->GetLightComponent()->SetMobility(EComponentMobility::Movable);
+    Sky->GetLightComponent()->SetRealTimeCapture(true);
+  }
+  UE_LOG(LogReconTwin, Display, TEXT("ReconTwin: level had no light; added sun, sky light and atmosphere"));
 }
 
 AReconTwinTile::AReconTwinTile()
@@ -279,6 +331,34 @@ bool FReconTwinLoader::Load(UWorld *World, const FString &ManifestPath,
     return false;
   }
 
+  FGridToTrue Frame;
+  const TSharedPtr<FJsonObject> *Geo = nullptr;
+  const TSharedPtr<FJsonObject> *Grid = nullptr;
+  const TArray<TSharedPtr<FJsonValue>> *Rows = nullptr;
+  if (Root->TryGetObjectField(TEXT("geo"), Geo) &&
+      (*Geo)->TryGetObjectField(TEXT("grid_to_true"), Grid) &&
+      (*Grid)->TryGetArrayField(TEXT("matrix"), Rows) && Rows->Num() == 2 &&
+      (*Rows)[0]->AsArray().Num() == 2 && (*Rows)[1]->AsArray().Num() == 2)
+  {
+    Frame.NorthOfEast = (*Rows)[0]->AsArray()[0]->AsNumber();
+    Frame.NorthOfNorth = (*Rows)[0]->AsArray()[1]->AsNumber();
+    Frame.EastOfEast = (*Rows)[1]->AsArray()[0]->AsNumber();
+    Frame.EastOfNorth = (*Rows)[1]->AsArray()[1]->AsNumber();
+  }
+  else
+  {
+    UE_LOG(LogReconTwin, Warning,
+           TEXT("ReconTwin: manifest has no geo.grid_to_true matrix; taking grid north as true north"));
+  }
+
+  EnsureLighting(World);
+
+  // The visual layer's v0: per-vertex colours taken from the scan's splats
+  // (tools/make_twin_colors.py), shown through the engine's vertex-colour
+  // material. Absent colours leave the default grey; sensors never read either.
+  UMaterialInterface *VertexColorMaterial = LoadObject<UMaterialInterface>(
+      nullptr, TEXT("/Engine/EngineDebugMaterials/VertexColorMaterial.VertexColorMaterial"));
+
   const FString BaseDir = FPaths::GetPath(ManifestPath);
   for (const TSharedPtr<FJsonValue> &Value : *Tiles)
   {
@@ -312,7 +392,7 @@ bool FReconTwinLoader::Load(UWorld *World, const FString &ManifestPath,
     Vertices.SetNumUninitialized(Ply.Positions.Num());
     for (int32 i = 0; i < Ply.Positions.Num(); ++i)
     {
-      Vertices[i] = ToUnreal(Ply.Positions[i]);
+      Vertices[i] = Frame.ToUnreal(Ply.Positions[i]);
       Summary.Bounds += Vertices[i] + OriginCm;
     }
     TArray<FVector> Normals;
@@ -343,9 +423,34 @@ bool FReconTwinLoader::Load(UWorld *World, const FString &ManifestPath,
       UE_LOG(LogReconTwin, Error, TEXT("ReconTwin: could not spawn tile %s"), *File);
       return false;
     }
+    TArray<FLinearColor> Colors;
+    FString ColorFile;
+    if (Tile->TryGetStringField(TEXT("colors"), ColorFile))
+    {
+      TArray<uint8> Bytes;
+      if (FFileHelper::LoadFileToArray(Bytes, *FPaths::Combine(BaseDir, ColorFile)) &&
+          Bytes.Num() == Vertices.Num() * 3)
+      {
+        Colors.SetNumUninitialized(Vertices.Num());
+        for (int32 i = 0; i < Vertices.Num(); ++i)
+        {
+          // The bytes are display (sRGB) values; FLinearColor(FColor) decodes them.
+          Colors[i] = FLinearColor(FColor(Bytes[i * 3], Bytes[i * 3 + 1], Bytes[i * 3 + 2]));
+        }
+      }
+      else
+      {
+        UE_LOG(LogReconTwin, Warning, TEXT("ReconTwin: %s: colour file missing or not %d bytes"),
+               *ColorFile, Vertices.Num() * 3);
+      }
+    }
     Actor->Mesh->CreateMeshSection_LinearColor(
         0, Vertices, Ply.Indices, Normals, TArray<FVector2D>(),
-        TArray<FLinearColor>(), TArray<FProcMeshTangent>(), /*bCreateCollision=*/true);
+        Colors, TArray<FProcMeshTangent>(), /*bCreateCollision=*/true);
+    if (Colors.Num() > 0 && VertexColorMaterial != nullptr)
+    {
+      Actor->Mesh->SetMaterial(0, VertexColorMaterial);
+    }
 
     // Spec §3 trap 2: one stencil serves both readers. PAS copies the root
     // component's CustomDepthStencilValue into collision_info.segmentation_id;
@@ -354,6 +459,11 @@ bool FReconTwinLoader::Load(UWorld *World, const FString &ManifestPath,
     Actor->Mesh->SetCustomDepthStencilValue(static_cast<int32>(Label));
     Actor->Mesh->SetRenderCustomDepth(true);
     ATagger::SetStencilValue(*Actor->Mesh, Actor->GetUniqueID(), Label, true);
+    // CARLA's lidars read the label from ComponentTags[0] without checking
+    // the array has one (RayCastSemanticLidar.cpp:227); a hit on an untagged
+    // component asserts and takes the sim down. The tagger itself writes the
+    // label's name there, so do the same.
+    Actor->Mesh->ComponentTags.Add(FName(*ATagger::GetTagAsString(Label)));
 
     Summary.Tiles += 1;
     Summary.Vertices += Vertices.Num();
