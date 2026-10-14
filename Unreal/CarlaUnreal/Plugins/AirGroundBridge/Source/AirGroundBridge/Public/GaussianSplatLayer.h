@@ -6,10 +6,17 @@
 // §7 branch B).
 //
 // Input is an `.agsplat` pack from tools/make_twin_splats.py: a 64-byte header
-// ("AGSP", version 1, count, flags, bbox, env count) and 32-byte records in
-// the scan's grid frame (metres): float3 position, half4 quaternion (w x y z),
-// half3 scale, uint8 rgba (display sRGB colour, linear opacity), 2 bytes
-// padding. The scan's sky sphere comes last; -ReconTwinSplatsNoEnv drops it.
+// ("AGSP", version 2, count, flags, bbox, env count, node count, top count),
+// a 48-byte node table (the scan's LOD tree, breadth first, children
+// contiguous: record range, child range, level, typical splat size, bbox) and
+// 32-byte records in the scan's grid frame (metres): float3 position, half4
+// quaternion (w x y z), half3 scale, uint8 rgba (display sRGB colour, linear
+// opacity), 2 bytes padding. Version 1 packs (no table) load as one node.
+// The scan's sky sphere comes last; -ReconTwinSplatsNoEnv drops it.
+//
+// Per view the renderer walks the tree and keeps a node when its typical
+// splat projects to at most ag.Splat.LodPixels, so a region is drawn once at
+// the level its distance calls for, within ag.Splat.Budget splats.
 
 #pragma once
 
@@ -27,6 +34,8 @@ struct FGaussianSplatSummary
 {
   int32 InFile = 0;
   int32 Loaded = 0;
+  int32 Nodes = 0;    // LOD tree nodes (1 for a single-tier pack)
+  int32 Capacity = 0; // splats sorted per view at most
   FBox Bounds = FBox(ForceInit); // UE world, cm
   double Seconds = 0.0;
 };

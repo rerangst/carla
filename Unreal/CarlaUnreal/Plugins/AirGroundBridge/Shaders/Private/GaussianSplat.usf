@@ -25,7 +25,12 @@ StructuredBuffer<FSplat> Splats;
 Buffer<uint> SortedIds;
 RWBuffer<uint> OutKeys;
 RWBuffer<uint> OutValues;
-uint NumSplats;
+// The view's selection: LOD-tree nodes picked this frame, as record ranges
+// (first, count, prefix in the compacted index space, unused). Compacted
+// index i belongs to the last range whose prefix is <= i.
+StructuredBuffer<uint4> Ranges;
+uint NumRanges;
+uint NumSplats;      // selected this view, i.e. the compacted count
 float3 PreViewTranslation;
 float ColorScale; // Intensity cvar x the view's pre-exposure, set per view
 
@@ -34,17 +39,24 @@ float ColorScale; // Intensity cvar x the view's pre-exposure, set per view
 [numthreads(256, 1, 1)]
 void KeyGenCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
-	const uint Index = DispatchThreadId.x;
-	if (Index >= NumSplats)
+	const uint Slot = DispatchThreadId.x;
+	if (Slot >= NumSplats)
 	{
 		return;
 	}
+	uint Lo = 0u, Hi = NumRanges - 1u;
+	while (Lo < Hi)
+	{
+		const uint Mid = (Lo + Hi + 1u) >> 1u;
+		if (Ranges[Mid].z <= Slot) Lo = Mid; else Hi = Mid - 1u;
+	}
+	const uint Index = Ranges[Lo].x + (Slot - Ranges[Lo].z);
 	const float3 ViewPos = mul(float4(Splats[Index].Position + PreViewTranslation, 1.0), View.TranslatedWorldToView).xyz;
 	// Positive floats sort as their bit patterns. Anything behind the camera
 	// gets the largest key: it lands at the far end and the vertex shader
 	// drops it.
-	OutKeys[Index] = (ViewPos.z > 0.0) ? asuint(ViewPos.z) : 0xFFFFFFFFu;
-	OutValues[Index] = Index;
+	OutKeys[Slot] = (ViewPos.z > 0.0) ? asuint(ViewPos.z) : 0xFFFFFFFFu;
+	OutValues[Slot] = Index;
 }
 
 // ------------------------------------------------------------ draw

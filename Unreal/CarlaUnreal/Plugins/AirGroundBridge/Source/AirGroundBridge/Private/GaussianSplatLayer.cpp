@@ -1,12 +1,15 @@
 #include "GaussianSplatLayer.h"
 
 #include "CommonRenderResources.h"
+#include "Async/ParallelFor.h"
 #include "Engine/World.h"
 #include "GPUSort.h"
 #include "GlobalShader.h"
 #include "HAL/IConsoleManager.h"
 #include "Math/Float16.h"
 #include "Misc/CommandLine.h"
+#include "HAL/PlatformFileManager.h"
+#include "GenericPlatform/GenericPlatformFile.h"
 #include "Misc/FileHelper.h"
 #include "PipelineStateCache.h"
 #include "PostProcess/PostProcessInputs.h"
@@ -28,6 +31,25 @@ DEFINE_LOG_CATEGORY_STATIC(LogGaussianSplat, Log, All);
 static TAutoConsoleVariable<int32> CVarSplatEnable(
     TEXT("ag.Splat.Enable"), 1,
     TEXT("Draw the ReconTwin Gaussian splat layer (0 = collision mesh only)."),
+    ECVF_RenderThreadSafe);
+
+// LOD selection. A node of the scan's tree is drawn when its typical splat
+// would cover at most LodPixels on screen; otherwise its children are
+// visited. Budget caps the splats sorted per view; when the pick exceeds it
+// the pixel threshold is raised until it fits.
+static TAutoConsoleVariable<float> CVarSplatLodPixels(
+    TEXT("ag.Splat.LodPixels"), 2.0f,
+    TEXT("Projected splat size (px) above which a finer LOD level is used."),
+    ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarSplatBudget(
+    TEXT("ag.Splat.Budget"), 8000000,
+    TEXT("Max splats sorted and drawn per view (sort buffers are sized for it at load)."),
+    ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarSplatLogLod(
+    TEXT("ag.Splat.LogLod"), 0,
+    TEXT("Log every view's LOD pick (nodes, splats, threshold)."),
     ECVF_RenderThreadSafe);
 
 static TAutoConsoleVariable<int32> CVarSplatWriteDepth(
@@ -72,9 +94,30 @@ struct FSplatRecordGPU
 };
 static_assert(sizeof(FSplatRecordGPU) == 40, "FSplatRecordGPU must match the HLSL layout");
 
+/// One node of the scan's LOD tree, in UE world units.
+struct FSplatNode
+{
+  uint32 First = 0, Count = 0;
+  uint32 ChildFirst = 0, ChildCount = 0;
+  uint32 Level = 0;
+  float SplatSizeCm = 0.0f;
+  FBox Bounds = FBox(ForceInit);
+};
+
+/// A range of records picked for one view, in the compacted index space the
+/// key shader works in. Mirrors uint4 in the shader.
+struct FSplatRange
+{
+  uint32 First, Count, Prefix, Pad;
+};
+
 struct FSplatResources
 {
-  uint32 Count = 0;
+  uint32 Count = 0;      // records on the GPU
+  uint32 Capacity = 0;   // sort buffers: max selected per view
+  uint32 EnvFirst = 0, EnvCount = 0;
+  TArray<FSplatNode> Nodes;
+  uint32 TopCount = 0;
   FBufferRHIRef SplatBuffer;
   FShaderResourceViewRHIRef SplatSRV;
   FBufferRHIRef Keys[2], Values[2];
@@ -98,6 +141,8 @@ public:
   SHADER_USE_PARAMETER_STRUCT(FSplatKeyGenCS, FGlobalShader);
   BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
     SHADER_PARAMETER_STRUCT_INCLUDE(FSplatCommonParameters, Common)
+    SHADER_PARAMETER_RDG_BUFFER_SRV(StructuredBuffer<uint4>, Ranges)
+    SHADER_PARAMETER(uint32, NumRanges)
     SHADER_PARAMETER_UAV(RWBuffer<uint>, OutKeys)
     SHADER_PARAMETER_UAV(RWBuffer<uint>, OutValues)
   END_SHADER_PARAMETER_STRUCT()
@@ -182,6 +227,8 @@ public:
   bool bMeshHiddenInMainView = false;
   std::atomic<int32> NumSplats{0};
 
+  int32 LodLogsLeft = 6; // first picks are logged regardless of ag.Splat.LogLod
+
   // Sort verification, render thread only.
   TUniquePtr<FRHIGPUBufferReadback> SortReadback;
   TUniquePtr<FRHIGPUBufferReadback> KeyReadback; // before the sort
@@ -209,7 +256,75 @@ void FGaussianSplatSceneViewExtension::PrePostProcessPass_RenderThread(
     return;
   }
 
-  const uint32 Count = Res->Count;
+  // LOD pick for this view: walk the tree from the top, descend while a
+  // node's typical splat would be wider than LodPixels on screen, drop nodes
+  // outside the frustum, and raise the threshold until the pick fits the
+  // sort buffers. The sky sphere is always in.
+  const FVector CameraPos = View.ViewMatrices.GetViewOrigin();
+  const double FocalPx = View.ViewMatrices.GetProjectionMatrix().M[0][0] * 0.5 * View.ViewRect.Width();
+  const bool bNoEnv = Res->EnvCount == 0;
+  TArray<FSplatRange> Ranges;
+  TArray<uint32> Stack;
+  uint32 Selected = 0, NodesPicked = 0;
+  float Tau = FMath::Max(0.25f, CVarSplatLodPixels.GetValueOnRenderThread());
+  for (int32 Attempt = 0; Attempt < 10; ++Attempt)
+  {
+    Ranges.Reset();
+    Stack.Reset();
+    Selected = 0;
+    NodesPicked = 0;
+    for (uint32 i = 0; i < Res->TopCount; ++i) Stack.Add(i);
+    while (Stack.Num() > 0)
+    {
+      const FSplatNode &Node = Res->Nodes[Stack.Pop(EAllowShrinking::No)];
+      if (!View.ViewFrustum.IntersectBox(Node.Bounds.GetCenter(), Node.Bounds.GetExtent()))
+      {
+        continue;
+      }
+      const double Dist = FMath::Max(100.0, FMath::Sqrt(Node.Bounds.ComputeSquaredDistanceToPoint(CameraPos)));
+      const double Pixels = Node.SplatSizeCm * FocalPx / Dist;
+      if (Pixels > Tau && Node.ChildCount > 0)
+      {
+        for (uint32 c = 0; c < Node.ChildCount; ++c) Stack.Add(Node.ChildFirst + c);
+        continue;
+      }
+      if (Node.Count > 0)
+      {
+        Ranges.Add({Node.First, Node.Count, Selected, 0});
+        Selected += Node.Count;
+        ++NodesPicked;
+      }
+    }
+    if (!bNoEnv)
+    {
+      Ranges.Add({Res->EnvFirst, Res->EnvCount, Selected, 0});
+      Selected += Res->EnvCount;
+    }
+    if (Selected <= Res->Capacity) break;
+    Tau *= 1.3f;
+  }
+  while (Selected > Res->Capacity && Ranges.Num() > 0)
+  {
+    // Still over after ten tries: shed whole ranges from the end.
+    Selected = Ranges.Last().Prefix;
+    Ranges.Pop(EAllowShrinking::No);
+  }
+  if (Selected == 0 || Ranges.Num() == 0)
+  {
+    return;
+  }
+  if (LodLogsLeft > 0 || CVarSplatLogLod.GetValueOnRenderThread() != 0)
+  {
+    --LodLogsLeft;
+    UE_LOG(LogGaussianSplat, Display,
+           TEXT("GaussianSplat: view %s at (%.0f %.0f %.0f) cm, focal %.0f px: %u nodes, %u splats (+%u sky) at %.2f px, budget %u"),
+           View.bIsSceneCapture ? TEXT("capture") : TEXT("main"), CameraPos.X, CameraPos.Y, CameraPos.Z, FocalPx,
+           NodesPicked, Selected - (bNoEnv ? 0u : Res->EnvCount), bNoEnv ? 0u : Res->EnvCount, Tau, Res->Capacity);
+  }
+  const uint32 Count = Selected;
+  FRDGBufferRef RangesBuffer = CreateStructuredBuffer(
+      GraphBuilder, TEXT("ReconTwinSplatRanges"), sizeof(FSplatRange), Ranges.Num(), Ranges.GetData(),
+      Ranges.Num() * sizeof(FSplatRange));
 
   if (SortReadback.IsValid() && SortReadback->IsReady() && KeyReadback->IsReady())
   {
@@ -281,6 +396,8 @@ void FGaussianSplatSceneViewExtension::PrePostProcessPass_RenderThread(
   TShaderMapRef<FSplatKeyGenCS> KeyGenCS(View.ShaderMap);
   FSplatKeyGenCS::FParameters *KeyParams = GraphBuilder.AllocParameters<FSplatKeyGenCS::FParameters>();
   KeyParams->Common = Common;
+  KeyParams->Ranges = GraphBuilder.CreateSRV(RangesBuffer);
+  KeyParams->NumRanges = Ranges.Num();
   KeyParams->OutKeys = Res->KeyUAV[0];
   KeyParams->OutValues = Res->ValueUAV[0];
   const ERHIFeatureLevel::Type FeatureLevel = View.GetFeatureLevel();
@@ -374,8 +491,16 @@ struct FPackHeader
   uint32 Flags;
   float BoundsMin[3];
   float BoundsMax[3];
-  uint32 EnvCount; // sky-sphere records, kept last in the file
-  uint32 Reserved[5];
+  uint32 EnvCount;  // sky-sphere records, kept last in the file
+  uint32 NodeCount; // v2: LOD tree table follows the header
+  uint32 TopCount;  // v2: the first TopCount nodes are the tree's top level
+  uint32 Reserved[3];
+};
+struct FPackNode
+{
+  uint32 First, Count, ChildFirst, ChildCount, Level;
+  float SplatSize; // metres
+  float BoundsMin[3], BoundsMax[3]; // scan grid frame, metres
 };
 struct FPackRecord
 {
@@ -387,6 +512,7 @@ struct FPackRecord
 };
 #pragma pack(pop)
 static_assert(sizeof(FPackHeader) == 64, "pack header is 64 bytes");
+static_assert(sizeof(FPackNode) == 48, "pack node is 48 bytes");
 static_assert(sizeof(FPackRecord) == 32, "pack record is 32 bytes");
 
 float Half(uint16 Encoded)
@@ -412,52 +538,137 @@ bool FGaussianSplatLayer::Load(const FString &PackPath, const FSplatFrame &Frame
                                FGaussianSplatSummary &Summary, FString &Error)
 {
   const double Started = FPlatformTime::Seconds();
-  TArray<uint8> Bytes;
-  if (!FFileHelper::LoadFileToArray(Bytes, *PackPath))
+  if (GUsingNullRHI)
   {
-    Error = TEXT("cannot read file");
+    // Headless: nothing will draw, and a multi-level pack is gigabytes.
+    UE_LOG(LogGaussianSplat, Display, TEXT("GaussianSplat: null RHI, %s not loaded"), *PackPath);
+    return true;
+  }
+  // Streamed: a multi-level pack is several GB, past TArray's 2 GB reach and
+  // not worth holding twice. Header, node table, then records in chunks that
+  // are converted as they arrive.
+  TUniquePtr<IFileHandle> File(FPlatformFileManager::Get().GetPlatformFile().OpenRead(*PackPath));
+  if (!File.IsValid())
+  {
+    Error = TEXT("cannot open file");
     return false;
   }
-  if (Bytes.Num() < (int32)sizeof(FPackHeader))
+  const int64 FileSize = File->Size();
+  if (FileSize < (int64)sizeof(FPackHeader))
   {
     Error = TEXT("shorter than a header");
     return false;
   }
   FPackHeader Header;
-  FMemory::Memcpy(&Header, Bytes.GetData(), sizeof(Header));
+  if (!File->Read(reinterpret_cast<uint8 *>(&Header), sizeof(Header)))
+  {
+    Error = TEXT("cannot read header");
+    return false;
+  }
   if (FMemory::Memcmp(Header.Magic, "AGSP", 4) != 0)
   {
     Error = TEXT("not an AGSP pack");
     return false;
   }
-  if (Header.Version != 1)
+  if (Header.Version != 1 && Header.Version != 2)
   {
-    Error = FString::Printf(TEXT("pack version %u, this build reads 1"), Header.Version);
+    Error = FString::Printf(TEXT("pack version %u, this build reads 1 and 2"), Header.Version);
     return false;
   }
-  const int64 Expected = (int64)sizeof(FPackHeader) + (int64)Header.Count * sizeof(FPackRecord);
-  if (Bytes.Num() != Expected)
+  const uint32 NodeCount = Header.Version >= 2 ? Header.NodeCount : 0;
+  const int64 Expected = (int64)sizeof(FPackHeader) + (int64)NodeCount * sizeof(FPackNode) +
+                         (int64)Header.Count * sizeof(FPackRecord);
+  if (FileSize != Expected)
   {
-    Error = FString::Printf(TEXT("%d bytes, header promises %lld"), Bytes.Num(), Expected);
+    Error = FString::Printf(TEXT("%lld bytes, header promises %lld"), FileSize, Expected);
     return false;
   }
   Summary.InFile = (int32)Header.Count;
   // The scan's sky sphere is the last EnvCount records. Dropping it leaves
   // the level's own sky and ground visible around the site.
   uint32 Count = Header.Count;
-  if (FParse::Param(FCommandLine::Get(), TEXT("ReconTwinSplatsNoEnv")) && Header.EnvCount <= Header.Count)
+  uint32 EnvCount = Header.EnvCount;
+  if (EnvCount > Count) EnvCount = 0;
+  if (FParse::Param(FCommandLine::Get(), TEXT("ReconTwinSplatsNoEnv")))
   {
-    Count -= Header.EnvCount;
+    Count -= EnvCount;
+    EnvCount = 0;
   }
+  const double (&M)[3][3] = Frame.M;
+  auto ToUnreal = [&M, &OriginCm](double X, double Y, double Z) {
+    return FVector(M[0][0] * X + M[0][1] * Y + M[0][2] * Z + OriginCm.X,
+                   M[1][0] * X + M[1][1] * Y + M[1][2] * Z + OriginCm.Y,
+                   M[2][0] * X + M[2][1] * Y + M[2][2] * Z + OriginCm.Z);
+  };
+  auto BoxToUnreal = [&ToUnreal](const float *Lo, const float *Hi) {
+    FBox Box(ForceInit);
+    for (int32 k = 0; k < 8; ++k)
+    {
+      Box += ToUnreal((k & 1) ? Hi[0] : Lo[0], (k & 2) ? Hi[1] : Lo[1], (k & 4) ? Hi[2] : Lo[2]);
+    }
+    return Box;
+  };
+
+  // The LOD tree; a v1 pack is one node holding everything.
+  TArray<FSplatNode> Nodes;
+  uint32 TopCount = 1;
+  const uint32 SceneCount = Count - EnvCount;
+  if (NodeCount > 0)
+  {
+    TArray<FPackNode> InNodes;
+    InNodes.SetNumUninitialized(NodeCount);
+    if (!File->Read(reinterpret_cast<uint8 *>(InNodes.GetData()), (int64)NodeCount * sizeof(FPackNode)))
+    {
+      Error = TEXT("cannot read the node table");
+      return false;
+    }
+    Nodes.SetNum(NodeCount);
+    for (uint32 i = 0; i < NodeCount; ++i)
+    {
+      const FPackNode &N = InNodes[i];
+      if ((uint64)N.First + N.Count > SceneCount || (uint64)N.ChildFirst + N.ChildCount > NodeCount)
+      {
+        Error = FString::Printf(TEXT("node %u points outside the pack"), i);
+        return false;
+      }
+      Nodes[i].First = N.First;
+      Nodes[i].Count = N.Count;
+      Nodes[i].ChildFirst = N.ChildFirst;
+      Nodes[i].ChildCount = N.ChildCount;
+      Nodes[i].Level = N.Level;
+      // Grid metres -> cm; the frame's scale is within 0.1 % of 100.
+      Nodes[i].SplatSizeCm = N.SplatSize * 100.0f;
+      Nodes[i].Bounds = BoxToUnreal(N.BoundsMin, N.BoundsMax);
+    }
+    TopCount = FMath::Clamp(Header.TopCount, 1u, NodeCount);
+  }
+  else
+  {
+    FSplatNode &Root = Nodes.AddDefaulted_GetRef();
+    Root.Count = SceneCount;
+    Root.Bounds = BoxToUnreal(Header.BoundsMin, Header.BoundsMax);
+  }
+  Summary.Bounds = BoxToUnreal(Header.BoundsMin, Header.BoundsMax);
 
   // Scan frame -> UE: position p' = M p + origin; covariance S' = (M R S)(M R S)^T.
-  const double (&M)[3][3] = Frame.M;
   TArray<FSplatRecordGPU> Records;
   Records.SetNumUninitialized(Count);
-  const FPackRecord *In = reinterpret_cast<const FPackRecord *>(Bytes.GetData() + sizeof(FPackHeader));
-  for (uint32 i = 0; i < Count; ++i)
+  TArray<FPackRecord> Chunk;
+  const uint32 ChunkRecords = 1u << 20; // 32 MB of file per read
+  Chunk.SetNumUninitialized(ChunkRecords);
+  for (uint32 Done = 0; Done < Count; Done += ChunkRecords)
   {
-    const FPackRecord &R = In[i];
+    const uint32 Num = FMath::Min(ChunkRecords, Count - Done);
+    if (!File->Read(reinterpret_cast<uint8 *>(Chunk.GetData()), (int64)Num * sizeof(FPackRecord)))
+    {
+      Error = FString::Printf(TEXT("read failed at record %u"), Done);
+      return false;
+    }
+    const FPackRecord *In = Chunk.GetData();
+    FSplatRecordGPU *OutBase = Records.GetData() + Done;
+    ParallelFor(Num, [&](int32 Index) {
+      const uint32 i = (uint32)Index;
+      const FPackRecord &R = In[i];
     const double P[3] = {R.Position[0], R.Position[1], R.Position[2]};
     double Q[4] = {Half(R.Quat[0]), Half(R.Quat[1]), Half(R.Quat[2]), Half(R.Quat[3])};
     const double Norm = FMath::Sqrt(Q[0] * Q[0] + Q[1] * Q[1] + Q[2] * Q[2] + Q[3] * Q[3]);
@@ -485,7 +696,7 @@ bool FGaussianSplatLayer::Load(const FString &PackPath, const FSplatFrame &Frame
       }
     }
     auto Cov = [&A](int32 r, int32 c) { return A[r][0] * A[c][0] + A[r][1] * A[c][1] + A[r][2] * A[c][2]; };
-    FSplatRecordGPU &Out = Records[i];
+    FSplatRecordGPU &Out = OutBase[i];
     Out.Position = FVector3f(
         (float)(M[0][0] * P[0] + M[0][1] * P[1] + M[0][2] * P[2] + OriginCm.X),
         (float)(M[1][0] * P[0] + M[1][1] * P[1] + M[1][2] * P[2] + OriginCm.Y),
@@ -498,24 +709,30 @@ bool FGaussianSplatLayer::Load(const FString &PackPath, const FSplatFrame &Frame
     Out.Cov[3] = (float)Cov(1, 1);
     Out.Cov[4] = (float)Cov(1, 2);
     Out.Cov[5] = (float)Cov(2, 2);
-    Summary.Bounds += FVector(Out.Position);
+    });
   }
-  Bytes.Empty();
+  File.Reset();
   Summary.Loaded = Records.Num();
+  Summary.Nodes = Nodes.Num();
 
-  if (GUsingNullRHI)
-  {
-    UE_LOG(LogGaussianSplat, Display, TEXT("GaussianSplat: null RHI, %d splats parsed and dropped"), Records.Num());
-    Summary.Seconds = FPlatformTime::Seconds() - Started;
-    return true;
-  }
+  // Sort buffers are sized for the per-view budget, never more than the pack.
+  int32 Budget = CVarSplatBudget.GetValueOnGameThread();
+  FParse::Value(FCommandLine::Get(), TEXT("ReconTwinSplatBudget="), Budget);
+  const uint32 Capacity = FMath::Clamp((uint32)FMath::Max(Budget, 1024), 1024u, Count);
+  Summary.Capacity = Capacity;
 
   EnsureExtension();
   TSharedPtr<FGaussianSplatSceneViewExtension, ESPMode::ThreadSafe> Ext = GSplatExtension;
   ENQUEUE_RENDER_COMMAND(ReconTwinSplatUpload)(
-      [Ext, Records = MoveTemp(Records)](FRHICommandListImmediate &RHICmdList) mutable {
+      [Ext, Records = MoveTemp(Records), Nodes = MoveTemp(Nodes), TopCount, EnvCount, Capacity](
+          FRHICommandListImmediate &RHICmdList) mutable {
         TSharedPtr<FSplatResources, ESPMode::ThreadSafe> Res = MakeShared<FSplatResources, ESPMode::ThreadSafe>();
         Res->Count = Records.Num();
+        Res->Capacity = Capacity;
+        Res->EnvCount = EnvCount;
+        Res->EnvFirst = Records.Num() - EnvCount;
+        Res->Nodes = MoveTemp(Nodes);
+        Res->TopCount = TopCount;
         const uint32 SplatBytes = Records.Num() * sizeof(FSplatRecordGPU);
         {
           const FRHIBufferCreateDesc Desc =
@@ -531,7 +748,7 @@ bool FGaussianSplatLayer::Load(const FString &PackPath, const FSplatFrame &Frame
                                     .SetType(FRHIViewDesc::EBufferType::Structured)
                                     .SetStride(sizeof(FSplatRecordGPU)));
         }
-        const uint32 KeyBytes = Records.Num() * sizeof(uint32);
+        const uint32 KeyBytes = Capacity * sizeof(uint32);
         for (int32 i = 0; i < 2; ++i)
         {
           const TCHAR *Names[2][2] = {{TEXT("ReconTwinSplatKeys0"), TEXT("ReconTwinSplatKeys1")},

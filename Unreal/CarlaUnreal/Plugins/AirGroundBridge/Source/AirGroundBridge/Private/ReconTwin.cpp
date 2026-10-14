@@ -357,10 +357,11 @@ FString StripJsonComments(const FString &In)
 namespace
 {
 
-/// Picks and loads a splat pack listed under `visual.packs` in the manifest.
+/// Picks and loads a splat pack listed under `visual.packs` in the manifest
+/// (first listed wins: make_twin_package.py puts the multi-level pack first).
 ///   -ReconTwinSplats=off        collision mesh only (the v0 vertex colours)
-///   -ReconTwinSplats=<lod>      that tier, or fail loudly if it is not listed
-///   -ReconTwinSplatBudget=<n>   default pick: the finest tier with <= n splats
+///   -ReconTwinSplats=<lod|name> a single tier by number, or a pack by file name
+///   -ReconTwinSplatBudget=<n>   splats sorted and drawn per view at most (ag.Splat.Budget)
 ///   -ReconTwinSplatsKeepMesh    leave the mesh visible under the splats
 ///   -ReconTwinSplatsNoEnv       drop the scan's sky sphere; keep the level's sky and ground
 void LoadVisualLayer(UWorld *World, const TSharedPtr<FJsonObject> &Root, const FString &BaseDir,
@@ -383,31 +384,36 @@ void LoadVisualLayer(UWorld *World, const TSharedPtr<FJsonObject> &Root, const F
     UE_LOG(LogReconTwin, Display, TEXT("ReconTwin splats: manifest lists no packs (tools/make_twin_splats.py)"));
     return;
   }
-  int32 Budget = 12000000;
-  FParse::Value(FCommandLine::Get(), TEXT("ReconTwinSplatBudget="), Budget);
-  const int32 WantedLod = Choice.IsEmpty() ? -1 : FCString::Atoi(*Choice);
+  const bool bWantNumber = !Choice.IsEmpty() && FCString::IsNumeric(*Choice);
+  const int32 WantedLod = bWantNumber ? FCString::Atoi(*Choice) : -1;
 
   FString File;
   int32 Lod = -1, Count = 0;
+  bool bFound = false;
   for (const TSharedPtr<FJsonValue> &Value : *Packs)
   {
     const TSharedPtr<FJsonObject> Pack = Value->AsObject();
     if (!Pack.IsValid()) continue;
-    const int32 PackLod = (int32)Pack->GetNumberField(TEXT("lod"));
+    const FString PackFile = Pack->GetStringField(TEXT("file"));
+    double PackLodNumber = -1.0;
+    Pack->TryGetNumberField(TEXT("lod"), PackLodNumber);
+    const int32 PackLod = (int32)PackLodNumber;
     const int32 PackCount = (int32)Pack->GetNumberField(TEXT("count"));
-    const bool bTake = WantedLod >= 0 ? (PackLod == WantedLod)
-                                      : (PackCount <= Budget && (Lod < 0 || PackLod < Lod));
+    const bool bTake = Choice.IsEmpty() ? true
+                       : bWantNumber   ? (PackLod == WantedLod)
+                                       : FPaths::GetBaseFilename(PackFile).Contains(Choice);
     if (bTake)
     {
-      File = Pack->GetStringField(TEXT("file"));
+      File = PackFile;
       Lod = PackLod;
       Count = PackCount;
+      bFound = true;
+      break;
     }
   }
-  if (Lod < 0)
+  if (!bFound)
   {
-    UE_LOG(LogReconTwin, Error, TEXT("ReconTwin splats: no pack matches (-ReconTwinSplats=%s, budget %d)"),
-           *Choice, Budget);
+    UE_LOG(LogReconTwin, Error, TEXT("ReconTwin splats: no pack matches -ReconTwinSplats=%s"), *Choice);
     return;
   }
 
@@ -450,10 +456,10 @@ void LoadVisualLayer(UWorld *World, const TSharedPtr<FJsonObject> &Root, const F
   }
   const FVector Min = Splats.Bounds.Min, Max = Splats.Bounds.Max;
   UE_LOG(LogReconTwin, Display,
-         TEXT("ReconTwin splats: lod %d, %d splats from %s (%d listed), bounds [%.1f %.1f %.1f]..[%.1f %.1f %.1f] cm, "
-              "%.1f s, mesh %s"),
-         Lod, Splats.Loaded, *File, Count, Min.X, Min.Y, Min.Z, Max.X, Max.Y, Max.Z, Splats.Seconds,
-         bKeepMesh ? TEXT("kept visible") : TEXT("hidden from RGB cameras and the spectator"));
+         TEXT("ReconTwin splats: %s, %d splats in %d LOD nodes (%d listed, lod %d), up to %d per view, "
+              "bounds [%.1f %.1f %.1f]..[%.1f %.1f %.1f] cm, %.1f s, mesh %s"),
+         *File, Splats.Loaded, Splats.Nodes, Count, Lod, Splats.Capacity, Min.X, Min.Y, Min.Z, Max.X, Max.Y, Max.Z,
+         Splats.Seconds, bKeepMesh ? TEXT("kept visible") : TEXT("hidden from RGB cameras and the spectator"));
 }
 
 } // namespace
