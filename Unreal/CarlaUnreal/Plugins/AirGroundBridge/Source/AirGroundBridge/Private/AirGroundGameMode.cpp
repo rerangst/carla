@@ -1,9 +1,9 @@
 #include "AirGroundGameMode.h"
+#include "AirGroundPedestrian.h"
 #include "ReconTwin.h"
 
 #include "EngineUtils.h"
 #include "Misc/Paths.h"
-#include "UObject/ConstructorHelpers.h"
 
 #include "Carla/Actor/ActorDescription.h"
 
@@ -30,44 +30,51 @@ AAirGroundGameMode::AAirGroundGameMode(
   ActorFactories.Add(AUtilActorFactory::StaticClass());
   ActorFactories.Add(AAIControllerFactory::StaticClass());
 
-  static ConstructorHelpers::FClassFinder<ACarlaActorFactory>
-      VehicleFactory(TEXT("/Game/Carla/Blueprints/Vehicles/BP_VehicleFactory"));
-  if (VehicleFactory.Succeeded())
+  // The Blueprint factories (vehicles, walkers, props) and the weather class
+  // are loaded in InitGame, see the header.
+  ActorFactories.Add(AAirGroundPedestrianFactory::StaticClass());
+}
+
+namespace
+{
+template <typename T>
+TSubclassOf<T> LoadBlueprintClass(const TCHAR *Path)
+{
+  UClass *Class = LoadClass<T>(nullptr, Path);
+  if (Class == nullptr)
   {
-    ActorFactories.Add(VehicleFactory.Class);
+    UE_LOG(LogTemp, Warning, TEXT("AirGroundBridge: Blueprint class %s not found"), Path);
+  }
+  return Class;
+}
+}  // namespace
+
+void AAirGroundGameMode::InitGame(
+    const FString &MapName, const FString &Options, FString &ErrorMessage)
+{
+  // CARLA's pedestrians were unloadable from this module's constructor: their
+  // animations carry an AnimationSequencerDataModel from the AnimationData
+  // plugin (PreDefault phase) and need AnimationDataController (loaded with
+  // the startup modules), neither of which exists at PostConfigInit. Loaded
+  // here, after every module, they work as upstream intends.
+  for (const TCHAR *Path : {
+           TEXT("/Game/Carla/Blueprints/Vehicles/BP_VehicleFactory.BP_VehicleFactory_C"),
+           TEXT("/Game/Carla/Blueprints/Walkers/BP_WalkerFactory.BP_WalkerFactory_C"),
+           TEXT("/Game/Carla/Blueprints/Props/BP_PropFactory.BP_PropFactory_C")})
+  {
+    if (TSubclassOf<ACarlaActorFactory> Factory = LoadBlueprintClass<ACarlaActorFactory>(Path))
+    {
+      ActorFactories.Add(Factory);
+    }
+  }
+  if (TSubclassOf<AWeather> Weather = LoadBlueprintClass<AWeather>(
+          TEXT("/Game/Carla/Blueprints/Weather/BP_CarlaWeather.BP_CarlaWeather_C")))
+  {
+    WeatherClass = Weather;
   }
 
-  // Walkers stay unregistered: CARLA's pedestrian animations abort on load
-  // under UE 5.8 with "no data model found past upgrade object version",
-  // taking the process with it.
-  //
-  // Two fixes were tried and both failed, so neither is worth repeating:
-  //   * ResavePackages over Content/Carla/Animations rewrote all 72 assets
-  //     (package version 1013 -> 1018, zero save failures) and rebuilt their
-  //     compressed data. The crash was unchanged: a resave rewrites what is in
-  //     memory, and the source data model is absent from the shipped content,
-  //     so there is nothing to restore.
-  //   * Moving the Death_Anim folder aside only advanced the crash to
-  //     Animations/Depot/man_xfull_Anim. The defect is spread across the
-  //     animation set, not isolated to one asset, so deleting offenders one at
-  //     a time is not a path to working pedestrians.
-  //
-  // This needs animation content that carries a data model - re-imported from
-  // source, or a CARLA content release built against UE 5.8.
-
-  static ConstructorHelpers::FClassFinder<ACarlaActorFactory>
-      PropFactory(TEXT("/Game/Carla/Blueprints/Props/BP_PropFactory"));
-  if (PropFactory.Succeeded())
-  {
-    ActorFactories.Add(PropFactory.Class);
-  }
-
-  static ConstructorHelpers::FClassFinder<AWeather>
-      WeatherBP(TEXT("/Game/Carla/Blueprints/Weather/BP_CarlaWeather"));
-  if (WeatherBP.Succeeded())
-  {
-    WeatherClass = WeatherBP.Class;
-  }
+  // Spawns the factories above, so they must be in place first.
+  Super::InitGame(MapName, Options, ErrorMessage);
 }
 
 void AAirGroundGameMode::StartPlay()

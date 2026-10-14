@@ -19,6 +19,13 @@ class AIRGROUNDBRIDGE_API AAirGroundGameMode : public ACarlaGameModeBase
 public:
   explicit AAirGroundGameMode(const FObjectInitializer &ObjectInitializer);
 
+  /// Blueprint factories and the weather class are loaded here, not in the
+  /// constructor: the CDO is built when this module loads (PostConfigInit),
+  /// before the AnimationData plugin and AnimationDataController exist, and
+  /// any Blueprint that reaches an animation asset at that point aborts the
+  /// process. By InitGame every module is up.
+  void InitGame(const FString &MapName, const FString &Options, FString &ErrorMessage) override;
+
   void StartPlay() override;
 
   void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
