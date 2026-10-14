@@ -21,8 +21,14 @@ struct FSplat
 	float2 CovB;     // yz zz
 };
 
-StructuredBuffer<FSplat> Splats;
+// Records live in up to four buffers of 2^26 (RHI buffers stop at 4 GB; a
+// full-detail scan is twice that). Index >> 26 picks the buffer.
+StructuredBuffer<FSplat> Splats0;
+StructuredBuffer<FSplat> Splats1;
+StructuredBuffer<FSplat> Splats2;
+StructuredBuffer<FSplat> Splats3;
 Buffer<uint> SortedIds;
+Texture2D<float4> SplatAccum; // composite pass: premultiplied display-space colour + coverage
 RWBuffer<uint> OutKeys;
 RWBuffer<uint> OutValues;
 // The view's selection: LOD-tree nodes picked this frame, as record ranges
@@ -32,7 +38,19 @@ StructuredBuffer<uint4> Ranges;
 uint NumRanges;
 uint NumSplats;      // selected this view, i.e. the compacted count
 float3 PreViewTranslation;
-float ColorScale; // Intensity cvar x the view's pre-exposure, set per view
+float ColorScale; // WhiteNits x Intensity x the view's pre-exposure, set per view
+
+FSplat LoadSplat(uint Index)
+{
+	const uint Local = Index & 0x3FFFFFFu;
+	switch (Index >> 26u)
+	{
+		case 0u: return Splats0[Local];
+		case 1u: return Splats1[Local];
+		case 2u: return Splats2[Local];
+		default: return Splats3[Local];
+	}
+}
 
 // ------------------------------------------------------------ sort keys
 
@@ -51,7 +69,7 @@ void KeyGenCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 		if (Ranges[Mid].z <= Slot) Lo = Mid; else Hi = Mid - 1u;
 	}
 	const uint Index = Ranges[Lo].x + (Slot - Ranges[Lo].z);
-	const float3 ViewPos = mul(float4(Splats[Index].Position + PreViewTranslation, 1.0), View.TranslatedWorldToView).xyz;
+	const float3 ViewPos = mul(float4(LoadSplat(Index).Position + PreViewTranslation, 1.0), View.TranslatedWorldToView).xyz;
 	// Positive floats sort as their bit patterns. Anything behind the camera
 	// gets the largest key: it lands at the far end and the vertex shader
 	// drops it.
@@ -89,7 +107,7 @@ void MainVS(uint VertexId : SV_VertexID, out FSplatInterpolants Out, out float4 
 	const uint Corner = VertexId - Slot * 6u;
 	// Keys sort ascending by depth; alpha blending wants far first.
 	const uint Index = SortedIds[NumSplats - 1u - Slot];
-	const FSplat S = Splats[Index];
+	const FSplat S = LoadSplat(Index);
 
 	const float3 T = mul(float4(S.Position + PreViewTranslation, 1.0), View.TranslatedWorldToView).xyz;
 	if (T.z <= 1.0) // behind or within 1 cm of the camera
@@ -164,6 +182,9 @@ void MainVS(uint VertexId : SV_VertexID, out FSplatInterpolants Out, out float4 
 	OutPosition = float4(Clip.xy + Offset * (2.0 * View.ViewSizeAndInvSize.zw) * Clip.w, Clip.zw);
 }
 
+// Splats blend among themselves in the scan's display space, the space the
+// model was optimised in: premultiplied "over" into an accumulation target.
+// The composite pass below turns the result linear once, for the scene.
 void MainPS(FSplatInterpolants In, in float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
 {
 	const float2 D = In.Offset;
@@ -177,6 +198,19 @@ void MainPS(FSplatInterpolants In, in float4 SvPosition : SV_POSITION, out float
 	{
 		discard;
 	}
-	const float3 Linear = SplatSRGBToLinear(In.Color.rgb) * ColorScale;
-	OutColor = float4(Linear, Alpha);
+	OutColor = float4(In.Color.rgb * Alpha, Alpha);
+}
+
+void CompositePS(in float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	const float4 Acc = SplatAccum.Load(int3(SvPosition.xy, 0));
+	const float Coverage = saturate(Acc.a);
+	if (Coverage <= 0.0)
+	{
+		discard;
+	}
+	const float3 Display = Acc.rgb / max(Coverage, 1e-4);
+	const float3 Linear = SplatSRGBToLinear(saturate(Display)) * ColorScale;
+	// Blend state ONE / INV_SRC_ALPHA: SceneColor = this + SceneColor * (1 - Coverage).
+	OutColor = float4(Linear * Coverage, Coverage);
 }

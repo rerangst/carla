@@ -12,6 +12,7 @@
 #include "GenericPlatform/GenericPlatformFile.h"
 #include "Misc/FileHelper.h"
 #include "PipelineStateCache.h"
+#include "PixelShaderUtils.h"
 #include "PostProcess/PostProcessInputs.h"
 #include "RHIGPUReadback.h"
 #include "RHIStaticStates.h"
@@ -74,11 +75,11 @@ static TAutoConsoleVariable<float> CVarSplatIntensity(
 // surface under the twin's sun: ReconTwin lights the level with 75000 lux,
 // a white diffuse surface then has 75000/pi = 23900 cd/m2. Left at 1 the
 // splats are black next to the sunlit ground.
-// 23900 would be the physical figure; 8000 is what matches the CPU reference's
-// tonal level through CARLA's default camera (test view: mean luminance 0.53
-// vs 0.48, correlation 0.79), the camera's fixed EV range being the reason.
+// 23900 would be the physical figure; 7000 is what matches the CPU reference's
+// tonal level through CARLA's default camera (test view: mean luminance 0.51
+// vs 0.48 at 8000; display-space blend, correlation 0.95), the camera's fixed EV range being the reason.
 static TAutoConsoleVariable<float> CVarSplatWhiteNits(
-    TEXT("ag.Splat.WhiteNits"), 8000.0f,
+    TEXT("ag.Splat.WhiteNits"), 7000.0f,
     TEXT("Scene luminance (cd/m2) that a display-white splat maps to; match the level's sun."),
     ECVF_RenderThreadSafe);
 
@@ -111,6 +112,10 @@ struct FSplatRange
   uint32 First, Count, Prefix, Pad;
 };
 
+// Records per GPU buffer: 2^26 x 40 bytes = 2.7 GB, under the RHI's 4 GB.
+static constexpr uint32 RecordsPerBuffer = 1u << 26;
+static constexpr uint32 MaxSplatBuffers = 4;
+
 struct FSplatResources
 {
   uint32 Count = 0;      // records on the GPU
@@ -118,8 +123,8 @@ struct FSplatResources
   uint32 EnvFirst = 0, EnvCount = 0;
   TArray<FSplatNode> Nodes;
   uint32 TopCount = 0;
-  FBufferRHIRef SplatBuffer;
-  FShaderResourceViewRHIRef SplatSRV;
+  TArray<FBufferRHIRef> SplatBuffers;
+  TArray<FShaderResourceViewRHIRef> SplatSRVs;
   FBufferRHIRef Keys[2], Values[2];
   FShaderResourceViewRHIRef KeySRV[2], ValueSRV[2];
   FUnorderedAccessViewRHIRef KeyUAV[2], ValueUAV[2];
@@ -129,7 +134,10 @@ struct FSplatResources
 
 BEGIN_SHADER_PARAMETER_STRUCT(FSplatCommonParameters, )
   SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
-  SHADER_PARAMETER_SRV(StructuredBuffer<FSplat>, Splats)
+  SHADER_PARAMETER_SRV(StructuredBuffer<FSplat>, Splats0)
+  SHADER_PARAMETER_SRV(StructuredBuffer<FSplat>, Splats1)
+  SHADER_PARAMETER_SRV(StructuredBuffer<FSplat>, Splats2)
+  SHADER_PARAMETER_SRV(StructuredBuffer<FSplat>, Splats3)
   SHADER_PARAMETER(uint32, NumSplats)
   SHADER_PARAMETER(FVector3f, PreViewTranslation)
 END_SHADER_PARAMETER_STRUCT()
@@ -175,7 +183,23 @@ public:
   DECLARE_GLOBAL_SHADER(FSplatPS);
   SHADER_USE_PARAMETER_STRUCT(FSplatPS, FGlobalShader);
   BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+  END_SHADER_PARAMETER_STRUCT()
+
+  static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters &Parameters)
+  {
+    return IsFeatureLevelSupported(Parameters.Platform, ERHIFeatureLevel::SM5);
+  }
+};
+
+class FSplatCompositePS : public FGlobalShader
+{
+public:
+  DECLARE_GLOBAL_SHADER(FSplatCompositePS);
+  SHADER_USE_PARAMETER_STRUCT(FSplatCompositePS, FGlobalShader);
+  BEGIN_SHADER_PARAMETER_STRUCT(FParameters, )
+    SHADER_PARAMETER_RDG_TEXTURE(Texture2D<float4>, SplatAccum)
     SHADER_PARAMETER(float, ColorScale)
+    RENDER_TARGET_BINDING_SLOTS()
   END_SHADER_PARAMETER_STRUCT()
 
   static bool ShouldCompilePermutation(const FGlobalShaderPermutationParameters &Parameters)
@@ -195,6 +219,7 @@ END_SHADER_PARAMETER_STRUCT()
 IMPLEMENT_GLOBAL_SHADER(FSplatKeyGenCS, "/Plugin/AirGroundBridge/Private/GaussianSplat.usf", "KeyGenCS", SF_Compute);
 IMPLEMENT_GLOBAL_SHADER(FSplatVS, "/Plugin/AirGroundBridge/Private/GaussianSplat.usf", "MainVS", SF_Vertex);
 IMPLEMENT_GLOBAL_SHADER(FSplatPS, "/Plugin/AirGroundBridge/Private/GaussianSplat.usf", "MainPS", SF_Pixel);
+IMPLEMENT_GLOBAL_SHADER(FSplatCompositePS, "/Plugin/AirGroundBridge/Private/GaussianSplat.usf", "CompositePS", SF_Pixel);
 
 // -------------------------------------------------------------- extension
 
@@ -379,7 +404,11 @@ void FGaussianSplatSceneViewExtension::PrePostProcessPass_RenderThread(
 
   FSplatCommonParameters Common;
   Common.View = View.ViewUniformBuffer;
-  Common.Splats = Res->SplatSRV;
+  // Unused slots get the first buffer: every slot needs a valid view.
+  Common.Splats0 = Res->SplatSRVs[0];
+  Common.Splats1 = Res->SplatSRVs.Num() > 1 ? Res->SplatSRVs[1] : Res->SplatSRVs[0];
+  Common.Splats2 = Res->SplatSRVs.Num() > 2 ? Res->SplatSRVs[2] : Res->SplatSRVs[0];
+  Common.Splats3 = Res->SplatSRVs.Num() > 3 ? Res->SplatSRVs[3] : Res->SplatSRVs[0];
   Common.NumSplats = Count;
   Common.PreViewTranslation = FVector3f(View.ViewMatrices.GetPreViewTranslation());
 
@@ -444,12 +473,17 @@ void FGaussianSplatSceneViewExtension::PrePostProcessPass_RenderThread(
                            (View.bIsSceneCapture
                                 ? (MeshProbe.IsValid() && View.HiddenPrimitives.Contains(MeshProbe))
                                 : bMeshHiddenInMainView);
+  // Splats blend among themselves in display space (the scan's own), into a
+  // transient target; one composite pass then converts to linear and lays
+  // the result over the scene by coverage.
+  FRDGTextureRef Accum = GraphBuilder.CreateTexture(
+      FRDGTextureDesc::Create2D(SceneColor->Desc.Extent, PF_FloatRGBA, FClearValueBinding::Transparent,
+                                TexCreate_RenderTargetable | TexCreate_ShaderResource),
+      TEXT("ReconTwinSplatAccum"));
   FSplatDrawPassParameters *Pass = GraphBuilder.AllocParameters<FSplatDrawPassParameters>();
   Pass->VS.Common = Common;
   Pass->VS.SortedIds = Res->ValueSRV[ResultIndex];
-  Pass->PS.ColorScale = CVarSplatWhiteNits.GetValueOnRenderThread() *
-                        CVarSplatIntensity.GetValueOnRenderThread() * View.PreExposure;
-  Pass->RenderTargets[0] = FRenderTargetBinding(SceneColor, ERenderTargetLoadAction::ELoad);
+  Pass->RenderTargets[0] = FRenderTargetBinding(Accum, ERenderTargetLoadAction::EClear);
   Pass->RenderTargets.DepthStencil = FDepthStencilBinding(
       SceneDepth, ERenderTargetLoadAction::ELoad, ERenderTargetLoadAction::ENoAction,
       bMeshHidden ? FExclusiveDepthStencil::DepthWrite_StencilNop : FExclusiveDepthStencil::DepthRead_StencilNop);
@@ -462,8 +496,9 @@ void FGaussianSplatSceneViewExtension::PrePostProcessPass_RenderThread(
         RHICmdList.SetViewport(ViewRect.Min.X, ViewRect.Min.Y, 0.0f, ViewRect.Max.X, ViewRect.Max.Y, 1.0f);
         FGraphicsPipelineStateInitializer PSOInit;
         RHICmdList.ApplyCachedRenderTargets(PSOInit);
-        PSOInit.BlendState = TStaticBlendState<CW_RGB, BO_Add, BF_SourceAlpha, BF_InverseSourceAlpha,
-                                               BO_Add, BF_Zero, BF_One>::GetRHI();
+        // Premultiplied over, colour and coverage alike.
+        PSOInit.BlendState = TStaticBlendState<CW_RGBA, BO_Add, BF_One, BF_InverseSourceAlpha,
+                                               BO_Add, BF_One, BF_InverseSourceAlpha>::GetRHI();
         PSOInit.RasterizerState = TStaticRasterizerState<FM_Solid, CM_None>::GetRHI();
         PSOInit.DepthStencilState = bMeshHidden
                                         ? TStaticDepthStencilState<true, CF_DepthNearOrEqual>::GetRHI()
@@ -478,6 +513,17 @@ void FGaussianSplatSceneViewExtension::PrePostProcessPass_RenderThread(
         RHICmdList.SetStreamSource(0, nullptr, 0);
         RHICmdList.DrawPrimitive(0, 2 * Count, 1);
       });
+
+  // 3. Composite: linear(display) x white x pre-exposure, over the scene.
+  FSplatCompositePS::FParameters *Composite = GraphBuilder.AllocParameters<FSplatCompositePS::FParameters>();
+  Composite->SplatAccum = Accum;
+  Composite->ColorScale = CVarSplatWhiteNits.GetValueOnRenderThread() *
+                          CVarSplatIntensity.GetValueOnRenderThread() * View.PreExposure;
+  Composite->RenderTargets[0] = FRenderTargetBinding(SceneColor, ERenderTargetLoadAction::ELoad);
+  TShaderMapRef<FSplatCompositePS> CompositeShader(View.ShaderMap);
+  FPixelShaderUtils::AddFullscreenPass(
+      GraphBuilder, View.ShaderMap, RDG_EVENT_NAME("ReconTwinSplatComposite"), CompositeShader, Composite, ViewRect,
+      TStaticBlendState<CW_RGB, BO_Add, BF_One, BF_InverseSourceAlpha, BO_Add, BF_Zero, BF_One>::GetRHI());
 }
 
 // ------------------------------------------------------------------ pack
@@ -714,6 +760,11 @@ bool FGaussianSplatLayer::Load(const FString &PackPath, const FSplatFrame &Frame
   File.Reset();
   Summary.Loaded = Records.Num();
   Summary.Nodes = Nodes.Num();
+  if (Count > RecordsPerBuffer * MaxSplatBuffers)
+  {
+    Error = FString::Printf(TEXT("%u records, this build holds at most %u"), Count, RecordsPerBuffer * MaxSplatBuffers);
+    return false;
+  }
 
   // Sort buffers are sized for the per-view budget, never more than the pack.
   int32 Budget = CVarSplatBudget.GetValueOnGameThread();
@@ -733,20 +784,23 @@ bool FGaussianSplatLayer::Load(const FString &PackPath, const FSplatFrame &Frame
         Res->EnvFirst = Records.Num() - EnvCount;
         Res->Nodes = MoveTemp(Nodes);
         Res->TopCount = TopCount;
-        const uint32 SplatBytes = Records.Num() * sizeof(FSplatRecordGPU);
+        for (uint32 First = 0; First < (uint32)Records.Num(); First += RecordsPerBuffer)
         {
+          const uint32 Num = FMath::Min(RecordsPerBuffer, (uint32)Records.Num() - First);
+          const uint32 SplatBytes = Num * sizeof(FSplatRecordGPU);
           const FRHIBufferCreateDesc Desc =
               FRHIBufferCreateDesc::CreateStructured(TEXT("ReconTwinSplats"), SplatBytes, sizeof(FSplatRecordGPU))
                   .AddUsage(EBufferUsageFlags::Static | EBufferUsageFlags::ShaderResource)
                   .SetInitActionInitializer()
                   .DetermineInitialState();
           FRHIBufferInitializer Initializer = RHICmdList.CreateBufferInitializer(Desc);
-          Initializer.WriteData(Records.GetData(), SplatBytes);
-          Res->SplatBuffer = Initializer.Finalize();
-          Res->SplatSRV = RHICmdList.CreateShaderResourceView(
-              Res->SplatBuffer, FRHIViewDesc::CreateBufferSRV()
-                                    .SetType(FRHIViewDesc::EBufferType::Structured)
-                                    .SetStride(sizeof(FSplatRecordGPU)));
+          Initializer.WriteData(Records.GetData() + First, SplatBytes);
+          FBufferRHIRef Buffer = Initializer.Finalize();
+          Res->SplatSRVs.Add(RHICmdList.CreateShaderResourceView(
+              Buffer, FRHIViewDesc::CreateBufferSRV()
+                          .SetType(FRHIViewDesc::EBufferType::Structured)
+                          .SetStride(sizeof(FSplatRecordGPU))));
+          Res->SplatBuffers.Add(MoveTemp(Buffer));
         }
         const uint32 KeyBytes = Capacity * sizeof(uint32);
         for (int32 i = 0; i < 2; ++i)
