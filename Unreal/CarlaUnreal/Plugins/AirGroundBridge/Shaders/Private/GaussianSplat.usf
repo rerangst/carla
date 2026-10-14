@@ -1,0 +1,170 @@
+// GaussianSplat.usf — ReconTwin visual layer: 3D Gaussian splats drawn as
+// screen-space ellipses (EWA splatting), back to front, over the lit scene
+// before post-processing. docs/recon-twin-spec.md §7 branch B.
+//
+// Maths follows the 3DGS reference (Kerbl et al. 2023): the 3x3 world
+// covariance is pushed through the view rotation and the perspective
+// Jacobian to a 2x2 screen covariance; each splat is a quad of 3 sigma on the
+// eigenvectors and the pixel shader evaluates the Gaussian from the conic.
+// Unreal specifics: row-vector matrices (mul(v, M)), view space has +Z
+// forward, clip space has +Y up, depth is reversed. Colours are the scan's
+// display sRGB values; SceneColor is linear and pre-exposed, so they are
+// decoded and scaled here and the tonemapper undoes that later.
+
+#include "/Engine/Private/Common.ush"
+
+struct FSplat
+{
+	float3 Position; // UE world, cm
+	uint   Color;    // R | G<<8 | B<<16 | A<<24: sRGB display colour, linear opacity
+	float4 CovA;     // xx xy xz yy  (UE world, cm^2)
+	float2 CovB;     // yz zz
+};
+
+StructuredBuffer<FSplat> Splats;
+Buffer<uint> SortedIds;
+RWBuffer<uint> OutKeys;
+RWBuffer<uint> OutValues;
+uint NumSplats;
+float3 PreViewTranslation;
+float ColorScale; // Intensity cvar x the view's pre-exposure, set per view
+
+// ------------------------------------------------------------ sort keys
+
+[numthreads(256, 1, 1)]
+void KeyGenCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint Index = DispatchThreadId.x;
+	if (Index >= NumSplats)
+	{
+		return;
+	}
+	const float3 ViewPos = mul(float4(Splats[Index].Position + PreViewTranslation, 1.0), View.TranslatedWorldToView).xyz;
+	// Positive floats sort as their bit patterns. Anything behind the camera
+	// gets the largest key: it lands at the far end and the vertex shader
+	// drops it.
+	OutKeys[Index] = (ViewPos.z > 0.0) ? asuint(ViewPos.z) : 0xFFFFFFFFu;
+	OutValues[Index] = Index;
+}
+
+// ------------------------------------------------------------ draw
+
+struct FSplatInterpolants
+{
+	nointerpolation float3 Conic : TEXCOORD0;
+	float2 Offset : TEXCOORD1;            // pixels from the centre, +Y up
+	nointerpolation float4 Color : TEXCOORD2;
+};
+
+float3 SplatSRGBToLinear(float3 C)
+{
+	return select(C > 0.04045, pow(C * (1.0 / 1.055) + 0.0521327, 2.4), C / 12.92);
+}
+
+float2 CornerSign(uint Corner)
+{
+	// Two triangles (0 1 2) (0 2 3) over corners (-1,-1) (1,-1) (1,1) (-1,1).
+	const uint Quad = (Corner < 3u) ? Corner : (Corner == 3u ? 0u : Corner - 2u);
+	return float2((Quad == 1u || Quad == 2u) ? 1.0 : -1.0, (Quad >= 2u) ? 1.0 : -1.0);
+}
+
+void MainVS(uint VertexId : SV_VertexID, out FSplatInterpolants Out, out float4 OutPosition : SV_POSITION)
+{
+	Out = (FSplatInterpolants)0;
+	OutPosition = float4(0.0, 0.0, -1.0, 1.0); // outside [0,1] depth: clipped
+
+	const uint Slot = VertexId / 6u;
+	const uint Corner = VertexId - Slot * 6u;
+	// Keys sort ascending by depth; alpha blending wants far first.
+	const uint Index = SortedIds[NumSplats - 1u - Slot];
+	const FSplat S = Splats[Index];
+
+	const float3 T = mul(float4(S.Position + PreViewTranslation, 1.0), View.TranslatedWorldToView).xyz;
+	if (T.z <= 1.0) // behind or within 1 cm of the camera
+	{
+		return;
+	}
+	const float4 Clip = mul(float4(T, 1.0), View.ViewToClip);
+	// Frustum test on the centre with the reference's 1.3 margin. A splat
+	// beside the camera has depth near zero and a footprint near infinity;
+	// the footprint test below would keep it and it would cover the picture.
+	const float2 Ndc = Clip.xy / Clip.w;
+	if (any(abs(Ndc) > 1.3))
+	{
+		return;
+	}
+	const float2 ViewSize = View.ViewSizeAndInvSize.xy;
+	const float Fx = View.ViewToClip[0][0] * 0.5 * ViewSize.x; // focal length, pixels
+	const float Fy = View.ViewToClip[1][1] * 0.5 * ViewSize.y;
+
+	// Perspective Jacobian at the splat, with the lateral position clamped to
+	// 1.3x the frustum so splats just outside it do not blow up.
+	const float LimX = 1.3 / View.ViewToClip[0][0];
+	const float LimY = 1.3 / View.ViewToClip[1][1];
+	const float Tx = clamp(T.x / T.z, -LimX, LimX) * T.z;
+	const float Ty = clamp(T.y / T.z, -LimY, LimY) * T.z;
+	const float Z2 = T.z * T.z;
+	const float2x3 J = float2x3(
+		Fx / T.z, 0.0, -Fx * Tx / Z2,
+		0.0, Fy / T.z, -Fy * Ty / Z2);
+	const float3x3 W = (float3x3)View.TranslatedWorldToView; // v_view = v_world * W
+	const float3x3 Vrk = float3x3(
+		S.CovA.x, S.CovA.y, S.CovA.z,
+		S.CovA.y, S.CovA.w, S.CovB.x,
+		S.CovA.z, S.CovB.x, S.CovB.y);
+	const float3x3 CovView = mul(transpose(W), mul(Vrk, W));
+	const float2x2 Cov2 = mul(J, mul(CovView, transpose(J)));
+
+	// 0.3 px low-pass as in the reference: nothing thinner than a pixel.
+	const float A = Cov2[0][0] + 0.3;
+	const float B = Cov2[0][1];
+	const float C = Cov2[1][1] + 0.3;
+	const float Det = A * C - B * B;
+	if (Det <= 0.0)
+	{
+		return;
+	}
+	const float Mid = 0.5 * (A + C);
+	const float Disc = sqrt(max(Mid * Mid - Det, 0.0));
+	const float L1 = Mid + Disc;
+	const float L2 = max(Mid - Disc, 0.01);
+	const float2 E1 = (abs(B) > 1e-6) ? normalize(float2(B, L1 - A)) : ((A >= C) ? float2(1.0, 0.0) : float2(0.0, 1.0));
+	const float2 E2 = float2(-E1.y, E1.x);
+	const float R1 = 3.0 * sqrt(L1);
+	const float R2 = 3.0 * sqrt(L2);
+
+	// Then by the footprint: most splats are small and off screen.
+	const float2 RadiusNdc = (R1 + R2) * 2.0 * View.ViewSizeAndInvSize.zw;
+	if (any(abs(Ndc) - RadiusNdc > 1.0))
+	{
+		return;
+	}
+
+	const float2 Signs = CornerSign(Corner);
+	const float2 Offset = E1 * (R1 * Signs.x) + E2 * (R2 * Signs.y);
+	Out.Offset = Offset;
+	Out.Conic = float3(C, -B, A) / Det;
+	Out.Color = float4(
+		float(S.Color & 0xFFu) / 255.0,
+		float((S.Color >> 8u) & 0xFFu) / 255.0,
+		float((S.Color >> 16u) & 0xFFu) / 255.0,
+		float(S.Color >> 24u) / 255.0);
+	OutPosition = float4(Clip.xy + Offset * (2.0 * View.ViewSizeAndInvSize.zw) * Clip.w, Clip.zw);
+}
+
+void MainPS(FSplatInterpolants In, in float4 SvPosition : SV_POSITION, out float4 OutColor : SV_Target0)
+{
+	const float2 D = In.Offset;
+	const float Power = -0.5 * (In.Conic.x * D.x * D.x + In.Conic.z * D.y * D.y) - In.Conic.y * D.x * D.y;
+	if (Power > 0.0)
+	{
+		discard;
+	}
+	const float Alpha = min(0.99, In.Color.a * exp(Power));
+	if (Alpha < 1.0 / 255.0)
+	{
+		discard;
+	}
+	const float3 Linear = SplatSRGBToLinear(In.Color.rgb) * ColorScale;
+	OutColor = float4(Linear, Alpha);
+}

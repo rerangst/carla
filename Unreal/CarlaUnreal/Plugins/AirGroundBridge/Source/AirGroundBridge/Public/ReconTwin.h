@@ -28,11 +28,29 @@ public:
   TObjectPtr<UProceduralMeshComponent> Mesh;
 };
 
+/// Keeps the collision mesh out of the pictures once the splat layer is up:
+/// the tiles are flagged scene-capture-only (so the spectator never sees
+/// them) and every CARLA RGB camera gets them in its HiddenActors list as it
+/// appears. Depth, semantic and other encoding cameras keep seeing the mesh,
+/// as do lidar and the drone's physics.
+UCLASS()
+class AIRGROUNDBRIDGE_API AReconTwinVisualCoordinator : public AActor
+{
+  GENERATED_BODY()
+
+public:
+  AReconTwinVisualCoordinator();
+  virtual void Tick(float DeltaSeconds) override;
+
+  TArray<TWeakObjectPtr<AActor>> TilesToHide;
+};
+
 struct FReconTwinSummary
 {
   int32 Tiles = 0;
   int64 Vertices = 0;
   int64 Triangles = 0;
+  int32 Splats = 0; // visual layer, 0 when off or absent
   FBox Bounds = FBox(ForceInit); // UE world, cm
   double Seconds = 0.0;
 };

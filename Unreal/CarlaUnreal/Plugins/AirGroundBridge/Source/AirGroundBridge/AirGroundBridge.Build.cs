@@ -18,6 +18,10 @@ public class AirGroundBridge : ModuleRules
             new string[] { "Carla", "ProjectAirSim", "RenderCore", "RHI",
                 // ReconTwin: twin.jsonc manifest + runtime collision tiles.
                 "Json", "ProceduralMeshComponent",
+                // GaussianSplatLayer: a scene view extension with its own
+                // global shaders (Renderer for FViewInfo and the post-process
+                // inputs, Projects to find the plugin's Shaders/ directory).
+                "Renderer", "Projects",
                 // Carla keeps these private, but its public headers
                 // (CarlaEpisode -> ActorData -> WheelPhysicsControl) need them.
                 "Chaos", "ChaosVehicles", "PhysicsCore", "Foliage" });
@@ -43,6 +47,9 @@ public class AirGroundBridge : ModuleRules
 
         string EngineDir = Path.GetFullPath(Target.RelativeEnginePath);
         Includes.Add(Path.Combine(EngineDir, "Source/Runtime/Renderer/Internal"));
+        // FViewInfo (SceneRendering.h) is private to the renderer; the splat
+        // pass needs its render-resolution rect and pre-exposure.
+        Includes.Add(Path.Combine(EngineDir, "Source/Runtime/Renderer/Private"));
 
         PrivateIncludePaths.AddRange(Includes);
     }

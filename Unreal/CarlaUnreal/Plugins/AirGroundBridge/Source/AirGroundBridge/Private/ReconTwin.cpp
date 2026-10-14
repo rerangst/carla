@@ -1,6 +1,9 @@
 #include "ReconTwin.h"
 
+#include "GaussianSplatLayer.h"
+
 #include "Components/DirectionalLightComponent.h"
+#include "Components/SceneCaptureComponent2D.h"
 #include "Components/SkyAtmosphereComponent.h"
 #include "Components/SkyLightComponent.h"
 #include "Dom/JsonObject.h"
@@ -18,6 +21,7 @@
 #include "Serialization/JsonSerializer.h"
 
 #include "Carla/Game/Tagger.h"
+#include "Carla/Sensor/SceneCaptureCamera.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogReconTwin, Log, All);
 
@@ -45,6 +49,16 @@ struct FGridToTrue
     const double North = NorthOfEast * P.X + NorthOfNorth * P.Y;
     const double East = EastOfEast * P.X + EastOfNorth * P.Y;
     return FVector(North * 100.0, East * 100.0, P.Z * 100.0);
+  }
+
+  /// The same map as a matrix, for the splat layer: grid metres -> UE cm.
+  FSplatFrame ToSplatFrame() const
+  {
+    FSplatFrame F;
+    F.M[0][0] = NorthOfEast * 100.0; F.M[0][1] = NorthOfNorth * 100.0; F.M[0][2] = 0.0;
+    F.M[1][0] = EastOfEast * 100.0;  F.M[1][1] = EastOfNorth * 100.0;  F.M[1][2] = 0.0;
+    F.M[2][0] = 0.0;                 F.M[2][1] = 0.0;                  F.M[2][2] = 100.0;
+    return F;
   }
 };
 
@@ -80,6 +94,39 @@ static void EnsureLighting(UWorld *World)
     Sky->GetLightComponent()->SetIntensity(2.5f); // fill for the faces the sun misses
   }
   UE_LOG(LogReconTwin, Display, TEXT("ReconTwin: level had no light; added sun, sky light and atmosphere"));
+}
+
+AReconTwinVisualCoordinator::AReconTwinVisualCoordinator()
+{
+  PrimaryActorTick.bCanEverTick = true;
+  PrimaryActorTick.bStartWithTickEnabled = true;
+  SetActorTickInterval(0.5f);
+}
+
+void AReconTwinVisualCoordinator::Tick(float DeltaSeconds)
+{
+  Super::Tick(DeltaSeconds);
+  UWorld *World = GetWorld();
+  if (World == nullptr)
+  {
+    return;
+  }
+  for (TActorIterator<ASceneCaptureCamera> It(World); It; ++It)
+  {
+    USceneCaptureComponent2D *Capture = It->GetCaptureComponent2D();
+    if (Capture == nullptr)
+    {
+      continue;
+    }
+    for (const TWeakObjectPtr<AActor> &Tile : TilesToHide)
+    {
+      AActor *Actor = Tile.Get();
+      if (Actor != nullptr && !Capture->HiddenActors.Contains(Actor))
+      {
+        Capture->HiddenActors.Add(Actor);
+      }
+    }
+  }
 }
 
 AReconTwinTile::AReconTwinTile()
@@ -305,6 +352,112 @@ FString StripJsonComments(const FString &In)
 
 } // namespace
 
+// --------------------------------------------------------- visual layer
+
+namespace
+{
+
+/// Picks and loads a splat pack listed under `visual.packs` in the manifest.
+///   -ReconTwinSplats=off        collision mesh only (the v0 vertex colours)
+///   -ReconTwinSplats=<lod>      that tier, or fail loudly if it is not listed
+///   -ReconTwinSplatBudget=<n>   default pick: the finest tier with <= n splats
+///   -ReconTwinSplatsKeepMesh    leave the mesh visible under the splats
+///   -ReconTwinSplatsNoEnv       drop the scan's sky sphere; keep the level's sky and ground
+void LoadVisualLayer(UWorld *World, const TSharedPtr<FJsonObject> &Root, const FString &BaseDir,
+                     const FGridToTrue &Frame, const FVector &OriginCm,
+                     const TArray<AReconTwinTile *> &TileActors, AStaticMeshActor *Ground,
+                     FReconTwinSummary &Summary)
+{
+  FString Choice;
+  FParse::Value(FCommandLine::Get(), TEXT("ReconTwinSplats="), Choice);
+  if (Choice == TEXT("off"))
+  {
+    UE_LOG(LogReconTwin, Display, TEXT("ReconTwin splats: off by request"));
+    return;
+  }
+  const TSharedPtr<FJsonObject> *Visual = nullptr;
+  const TArray<TSharedPtr<FJsonValue>> *Packs = nullptr;
+  if (!Root->TryGetObjectField(TEXT("visual"), Visual) || !(*Visual)->TryGetArrayField(TEXT("packs"), Packs) ||
+      Packs->Num() == 0)
+  {
+    UE_LOG(LogReconTwin, Display, TEXT("ReconTwin splats: manifest lists no packs (tools/make_twin_splats.py)"));
+    return;
+  }
+  int32 Budget = 12000000;
+  FParse::Value(FCommandLine::Get(), TEXT("ReconTwinSplatBudget="), Budget);
+  const int32 WantedLod = Choice.IsEmpty() ? -1 : FCString::Atoi(*Choice);
+
+  FString File;
+  int32 Lod = -1, Count = 0;
+  for (const TSharedPtr<FJsonValue> &Value : *Packs)
+  {
+    const TSharedPtr<FJsonObject> Pack = Value->AsObject();
+    if (!Pack.IsValid()) continue;
+    const int32 PackLod = (int32)Pack->GetNumberField(TEXT("lod"));
+    const int32 PackCount = (int32)Pack->GetNumberField(TEXT("count"));
+    const bool bTake = WantedLod >= 0 ? (PackLod == WantedLod)
+                                      : (PackCount <= Budget && (Lod < 0 || PackLod < Lod));
+    if (bTake)
+    {
+      File = Pack->GetStringField(TEXT("file"));
+      Lod = PackLod;
+      Count = PackCount;
+    }
+  }
+  if (Lod < 0)
+  {
+    UE_LOG(LogReconTwin, Error, TEXT("ReconTwin splats: no pack matches (-ReconTwinSplats=%s, budget %d)"),
+           *Choice, Budget);
+    return;
+  }
+
+  FGaussianSplatSummary Splats;
+  FString Error;
+  const FString PackPath = FPaths::Combine(BaseDir, File);
+  if (!FGaussianSplatLayer::Load(PackPath, Frame.ToSplatFrame(), OriginCm, Splats, Error))
+  {
+    UE_LOG(LogReconTwin, Error, TEXT("ReconTwin splats: %s: %s"), *PackPath, *Error);
+    return;
+  }
+  Summary.Splats = Splats.Loaded;
+
+  const bool bKeepMesh = FParse::Param(FCommandLine::Get(), TEXT("ReconTwinSplatsKeepMesh"));
+  if (!bKeepMesh)
+  {
+    AReconTwinVisualCoordinator *Coordinator = World->SpawnActor<AReconTwinVisualCoordinator>();
+    for (AReconTwinTile *Tile : TileActors)
+    {
+      Tile->Mesh->SetVisibleInSceneCaptureOnly(true);
+      if (Coordinator != nullptr)
+      {
+        Coordinator->TilesToHide.Add(Tile);
+      }
+    }
+    if (TileActors.Num() > 0)
+    {
+      FGaussianSplatLayer::SetMeshProbe(TileActors[0]->Mesh->GetPrimitiveSceneId(), /*bHiddenFromMainView=*/true);
+    }
+    // The scan's own surroundings (the env sphere in the pack) stand in for
+    // the ground plane in pictures; the plane stays for the encoding cameras.
+    if (Ground != nullptr && !FParse::Param(FCommandLine::Get(), TEXT("ReconTwinSplatsNoEnv")))
+    {
+      Ground->GetStaticMeshComponent()->SetVisibleInSceneCaptureOnly(true);
+      if (Coordinator != nullptr)
+      {
+        Coordinator->TilesToHide.Add(Ground);
+      }
+    }
+  }
+  const FVector Min = Splats.Bounds.Min, Max = Splats.Bounds.Max;
+  UE_LOG(LogReconTwin, Display,
+         TEXT("ReconTwin splats: lod %d, %d splats from %s (%d listed), bounds [%.1f %.1f %.1f]..[%.1f %.1f %.1f] cm, "
+              "%.1f s, mesh %s"),
+         Lod, Splats.Loaded, *File, Count, Min.X, Min.Y, Min.Z, Max.X, Max.Y, Max.Z, Splats.Seconds,
+         bKeepMesh ? TEXT("kept visible") : TEXT("hidden from RGB cameras and the spectator"));
+}
+
+} // namespace
+
 // --------------------------------------------------------------- loader
 
 bool FReconTwinLoader::Load(UWorld *World, const FString &ManifestPath,
@@ -365,6 +518,7 @@ bool FReconTwinLoader::Load(UWorld *World, const FString &ManifestPath,
       nullptr, TEXT("/Engine/EngineDebugMaterials/VertexColorMaterial.VertexColorMaterial"));
 
   const FString BaseDir = FPaths::GetPath(ManifestPath);
+  TArray<AReconTwinTile *> TileActors;
   for (const TSharedPtr<FJsonValue> &Value : *Tiles)
   {
     const TSharedPtr<FJsonObject> Tile = Value->AsObject();
@@ -495,11 +649,13 @@ bool FReconTwinLoader::Load(UWorld *World, const FString &ManifestPath,
     Summary.Tiles += 1;
     Summary.Vertices += Vertices.Num();
     Summary.Triangles += Ply.Indices.Num() / 3;
+    TileActors.Add(Actor);
   }
 
   // A level with nothing but the twin shows black void around and under it.
   // A plain ground plane below the lowest tile reads as terrain in pictures.
   // No collision and no tag: sensors and the drone never know it is there.
+  AStaticMeshActor *Ground = nullptr;
   if (Summary.Bounds.IsValid)
   {
     UStaticMesh *Plane = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Plane.Plane"));
@@ -512,7 +668,7 @@ bool FReconTwinLoader::Load(UWorld *World, const FString &ManifestPath,
       const FTransform Where(FRotator::ZeroRotator,
                              FVector(Centre.X, Centre.Y, Summary.Bounds.Min.Z - 200.0),
                              FVector(20000.0, 20000.0, 1.0)); // the plane is 1 m: 20 km across
-      AStaticMeshActor *Ground = World->SpawnActorDeferred<AStaticMeshActor>(
+      Ground = World->SpawnActorDeferred<AStaticMeshActor>(
           AStaticMeshActor::StaticClass(), Where, nullptr, nullptr,
           ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
       if (Ground != nullptr)
@@ -534,6 +690,8 @@ bool FReconTwinLoader::Load(UWorld *World, const FString &ManifestPath,
       }
     }
   }
+
+  LoadVisualLayer(World, Root, BaseDir, Frame, OriginCm, TileActors, Ground, Summary);
 
   Summary.Seconds = FPlatformTime::Seconds() - Started;
   const FVector Min = Summary.Bounds.Min, Max = Summary.Bounds.Max;
