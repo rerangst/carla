@@ -95,14 +95,18 @@ struct FSplatRecordGPU
 };
 static_assert(sizeof(FSplatRecordGPU) == 40, "FSplatRecordGPU must match the HLSL layout");
 
-/// One node of the scan's LOD tree, in UE world units.
-struct FSplatNode
+/// One grid cell of the pack, in UE world units, with its per-level ranges.
+struct FSplatCell
 {
-  uint32 First = 0, Count = 0;
-  uint32 ChildFirst = 0, ChildCount = 0;
-  uint32 Level = 0;
-  float SplatSizeCm = 0.0f;
+  uint32 RangeFirst = 0, RangeCount = 0;
   FBox Bounds = FBox(ForceInit);
+};
+
+/// A cell's records at one level: finest level first within a cell.
+struct FSplatLevelRange
+{
+  uint32 First = 0, Count = 0, Level = 0;
+  float SplatSizeCm = 0.0f;
 };
 
 /// A range of records picked for one view, in the compacted index space the
@@ -121,8 +125,8 @@ struct FSplatResources
   uint32 Count = 0;      // records on the GPU
   uint32 Capacity = 0;   // sort buffers: max selected per view
   uint32 EnvFirst = 0, EnvCount = 0;
-  TArray<FSplatNode> Nodes;
-  uint32 TopCount = 0;
+  TArray<FSplatCell> Cells;
+  TArray<FSplatLevelRange> LevelRanges;
   TArray<FBufferRHIRef> SplatBuffers;
   TArray<FShaderResourceViewRHIRef> SplatSRVs;
   FBufferRHIRef Keys[2], Values[2];
@@ -281,43 +285,45 @@ void FGaussianSplatSceneViewExtension::PrePostProcessPass_RenderThread(
     return;
   }
 
-  // LOD pick for this view: walk the tree from the top, descend while a
-  // node's typical splat would be wider than LodPixels on screen, drop nodes
-  // outside the frustum, and raise the threshold until the pick fits the
-  // sort buffers. The sky sphere is always in.
+  // LOD pick for this view: every grid cell inside the frustum draws at the
+  // coarsest level whose typical splat still projects to at most LodPixels;
+  // the threshold is raised until the pick fits the sort buffers. The sky
+  // sphere is always in.
   const FVector CameraPos = View.ViewMatrices.GetViewOrigin();
   const double FocalPx = View.ViewMatrices.GetProjectionMatrix().M[0][0] * 0.5 * View.ViewRect.Width();
   const bool bNoEnv = Res->EnvCount == 0;
   TArray<FSplatRange> Ranges;
-  TArray<uint32> Stack;
-  uint32 Selected = 0, NodesPicked = 0;
+  uint32 Selected = 0, CellsPicked = 0;
   float Tau = FMath::Max(0.25f, CVarSplatLodPixels.GetValueOnRenderThread());
   for (int32 Attempt = 0; Attempt < 10; ++Attempt)
   {
     Ranges.Reset();
-    Stack.Reset();
     Selected = 0;
-    NodesPicked = 0;
-    for (uint32 i = 0; i < Res->TopCount; ++i) Stack.Add(i);
-    while (Stack.Num() > 0)
+    CellsPicked = 0;
+    for (const FSplatCell &Cell : Res->Cells)
     {
-      const FSplatNode &Node = Res->Nodes[Stack.Pop(EAllowShrinking::No)];
-      if (!View.ViewFrustum.IntersectBox(Node.Bounds.GetCenter(), Node.Bounds.GetExtent()))
+      if (Cell.RangeCount == 0 ||
+          !View.ViewFrustum.IntersectBox(Cell.Bounds.GetCenter(), Cell.Bounds.GetExtent()))
       {
         continue;
       }
-      const double Dist = FMath::Max(100.0, FMath::Sqrt(Node.Bounds.ComputeSquaredDistanceToPoint(CameraPos)));
-      const double Pixels = Node.SplatSizeCm * FocalPx / Dist;
-      if (Pixels > Tau && Node.ChildCount > 0)
+      const double Dist = FMath::Max(100.0, FMath::Sqrt(Cell.Bounds.ComputeSquaredDistanceToPoint(CameraPos)));
+      // Coarsest first (ranges are stored finest first); fall back to the finest.
+      int32 Pick = (int32)Cell.RangeFirst;
+      for (int32 r = (int32)(Cell.RangeFirst + Cell.RangeCount) - 1; r >= (int32)Cell.RangeFirst; --r)
       {
-        for (uint32 c = 0; c < Node.ChildCount; ++c) Stack.Add(Node.ChildFirst + c);
-        continue;
+        if (Res->LevelRanges[r].SplatSizeCm * FocalPx / Dist <= Tau)
+        {
+          Pick = r;
+          break;
+        }
       }
-      if (Node.Count > 0)
+      const FSplatLevelRange &LR = Res->LevelRanges[Pick];
+      if (LR.Count > 0)
       {
-        Ranges.Add({Node.First, Node.Count, Selected, 0});
-        Selected += Node.Count;
-        ++NodesPicked;
+        Ranges.Add({LR.First, LR.Count, Selected, 0});
+        Selected += LR.Count;
+        ++CellsPicked;
       }
     }
     if (!bNoEnv)
@@ -342,9 +348,9 @@ void FGaussianSplatSceneViewExtension::PrePostProcessPass_RenderThread(
   {
     --LodLogsLeft;
     UE_LOG(LogGaussianSplat, Display,
-           TEXT("GaussianSplat: view %s at (%.0f %.0f %.0f) cm, focal %.0f px: %u nodes, %u splats (+%u sky) at %.2f px, budget %u"),
+           TEXT("GaussianSplat: view %s at (%.0f %.0f %.0f) cm, focal %.0f px: %u cells, %u splats (+%u sky) at %.2f px, budget %u"),
            View.bIsSceneCapture ? TEXT("capture") : TEXT("main"), CameraPos.X, CameraPos.Y, CameraPos.Z, FocalPx,
-           NodesPicked, Selected - (bNoEnv ? 0u : Res->EnvCount), bNoEnv ? 0u : Res->EnvCount, Tau, Res->Capacity);
+           CellsPicked, Selected - (bNoEnv ? 0u : Res->EnvCount), bNoEnv ? 0u : Res->EnvCount, Tau, Res->Capacity);
   }
   const uint32 Count = Selected;
   FRDGBufferRef RangesBuffer = CreateStructuredBuffer(
@@ -537,16 +543,20 @@ struct FPackHeader
   uint32 Flags;
   float BoundsMin[3];
   float BoundsMax[3];
-  uint32 EnvCount;  // sky-sphere records, kept last in the file
-  uint32 NodeCount; // v2: LOD tree table follows the header
-  uint32 TopCount;  // v2: the first TopCount nodes are the tree's top level
+  uint32 EnvCount;   // sky-sphere records, kept last in the file
+  uint32 CellCount;  // v3: grid cells follow the header
+  uint32 RangeCount; // v3: then the (cell, level) ranges
   uint32 Reserved[3];
 };
-struct FPackNode
+struct FPackCell
 {
-  uint32 First, Count, ChildFirst, ChildCount, Level;
-  float SplatSize; // metres
+  uint32 RangeFirst, RangeCount;
   float BoundsMin[3], BoundsMax[3]; // scan grid frame, metres
+};
+struct FPackRange
+{
+  uint32 First, Count, Level;
+  float SplatSize; // metres
 };
 struct FPackRecord
 {
@@ -558,7 +568,8 @@ struct FPackRecord
 };
 #pragma pack(pop)
 static_assert(sizeof(FPackHeader) == 64, "pack header is 64 bytes");
-static_assert(sizeof(FPackNode) == 48, "pack node is 48 bytes");
+static_assert(sizeof(FPackCell) == 32, "pack cell is 32 bytes");
+static_assert(sizeof(FPackRange) == 16, "pack range is 16 bytes");
 static_assert(sizeof(FPackRecord) == 32, "pack record is 32 bytes");
 
 float Half(uint16 Encoded)
@@ -616,14 +627,15 @@ bool FGaussianSplatLayer::Load(const FString &PackPath, const FSplatFrame &Frame
     Error = TEXT("not an AGSP pack");
     return false;
   }
-  if (Header.Version != 1 && Header.Version != 2)
+  if (Header.Version != 1 && Header.Version != 3)
   {
-    Error = FString::Printf(TEXT("pack version %u, this build reads 1 and 2"), Header.Version);
+    Error = FString::Printf(TEXT("pack version %u, this build reads 1 and 3 (v2 node trees: regenerate)"), Header.Version);
     return false;
   }
-  const uint32 NodeCount = Header.Version >= 2 ? Header.NodeCount : 0;
-  const int64 Expected = (int64)sizeof(FPackHeader) + (int64)NodeCount * sizeof(FPackNode) +
-                         (int64)Header.Count * sizeof(FPackRecord);
+  const uint32 CellCount = Header.Version >= 3 ? Header.CellCount : 0;
+  const uint32 RangeCount = Header.Version >= 3 ? Header.RangeCount : 0;
+  const int64 TableBytes = (int64)CellCount * sizeof(FPackCell) + (int64)RangeCount * sizeof(FPackRange);
+  const int64 Expected = (int64)sizeof(FPackHeader) + TableBytes + (int64)Header.Count * sizeof(FPackRecord);
   if (FileSize != Expected)
   {
     Error = FString::Printf(TEXT("%lld bytes, header promises %lld"), FileSize, Expected);
@@ -655,44 +667,59 @@ bool FGaussianSplatLayer::Load(const FString &PackPath, const FSplatFrame &Frame
     return Box;
   };
 
-  // The LOD tree; a v1 pack is one node holding everything.
-  TArray<FSplatNode> Nodes;
-  uint32 TopCount = 1;
+  // The grid; a v1 pack is one cell at one level holding everything.
+  TArray<FSplatCell> Cells;
+  TArray<FSplatLevelRange> LevelRanges;
   const uint32 SceneCount = Count - EnvCount;
-  if (NodeCount > 0)
+  if (CellCount > 0)
   {
-    TArray<FPackNode> InNodes;
-    InNodes.SetNumUninitialized(NodeCount);
-    if (!File->Read(reinterpret_cast<uint8 *>(InNodes.GetData()), (int64)NodeCount * sizeof(FPackNode)))
+    TArray<FPackCell> InCells;
+    TArray<FPackRange> InRanges;
+    InCells.SetNumUninitialized(CellCount);
+    InRanges.SetNumUninitialized(RangeCount);
+    if (!File->Read(reinterpret_cast<uint8 *>(InCells.GetData()), (int64)CellCount * sizeof(FPackCell)) ||
+        !File->Read(reinterpret_cast<uint8 *>(InRanges.GetData()), (int64)RangeCount * sizeof(FPackRange)))
     {
-      Error = TEXT("cannot read the node table");
+      Error = TEXT("cannot read the cell tables");
       return false;
     }
-    Nodes.SetNum(NodeCount);
-    for (uint32 i = 0; i < NodeCount; ++i)
+    Cells.SetNum(CellCount);
+    for (uint32 i = 0; i < CellCount; ++i)
     {
-      const FPackNode &N = InNodes[i];
-      if ((uint64)N.First + N.Count > SceneCount || (uint64)N.ChildFirst + N.ChildCount > NodeCount)
+      const FPackCell &C = InCells[i];
+      if ((uint64)C.RangeFirst + C.RangeCount > RangeCount)
       {
-        Error = FString::Printf(TEXT("node %u points outside the pack"), i);
+        Error = FString::Printf(TEXT("cell %u points outside the range table"), i);
         return false;
       }
-      Nodes[i].First = N.First;
-      Nodes[i].Count = N.Count;
-      Nodes[i].ChildFirst = N.ChildFirst;
-      Nodes[i].ChildCount = N.ChildCount;
-      Nodes[i].Level = N.Level;
-      // Grid metres -> cm; the frame's scale is within 0.1 % of 100.
-      Nodes[i].SplatSizeCm = N.SplatSize * 100.0f;
-      Nodes[i].Bounds = BoxToUnreal(N.BoundsMin, N.BoundsMax);
+      Cells[i].RangeFirst = C.RangeFirst;
+      Cells[i].RangeCount = C.RangeCount;
+      Cells[i].Bounds = BoxToUnreal(C.BoundsMin, C.BoundsMax);
     }
-    TopCount = FMath::Clamp(Header.TopCount, 1u, NodeCount);
+    LevelRanges.SetNum(RangeCount);
+    for (uint32 i = 0; i < RangeCount; ++i)
+    {
+      const FPackRange &R = InRanges[i];
+      if ((uint64)R.First + R.Count > SceneCount)
+      {
+        Error = FString::Printf(TEXT("range %u points outside the pack"), i);
+        return false;
+      }
+      LevelRanges[i].First = R.First;
+      LevelRanges[i].Count = R.Count;
+      LevelRanges[i].Level = R.Level;
+      // Grid metres -> cm; the frame's scale is within 0.1 % of 100.
+      LevelRanges[i].SplatSizeCm = R.SplatSize * 100.0f;
+    }
   }
   else
   {
-    FSplatNode &Root = Nodes.AddDefaulted_GetRef();
-    Root.Count = SceneCount;
+    FSplatCell &Root = Cells.AddDefaulted_GetRef();
+    Root.RangeFirst = 0;
+    Root.RangeCount = 1;
     Root.Bounds = BoxToUnreal(Header.BoundsMin, Header.BoundsMax);
+    FSplatLevelRange &All = LevelRanges.AddDefaulted_GetRef();
+    All.Count = SceneCount;
   }
   Summary.Bounds = BoxToUnreal(Header.BoundsMin, Header.BoundsMax);
 
@@ -759,7 +786,7 @@ bool FGaussianSplatLayer::Load(const FString &PackPath, const FSplatFrame &Frame
   }
   File.Reset();
   Summary.Loaded = Records.Num();
-  Summary.Nodes = Nodes.Num();
+  Summary.Nodes = Cells.Num();
   if (Count > RecordsPerBuffer * MaxSplatBuffers)
   {
     Error = FString::Printf(TEXT("%u records, this build holds at most %u"), Count, RecordsPerBuffer * MaxSplatBuffers);
@@ -775,15 +802,15 @@ bool FGaussianSplatLayer::Load(const FString &PackPath, const FSplatFrame &Frame
   EnsureExtension();
   TSharedPtr<FGaussianSplatSceneViewExtension, ESPMode::ThreadSafe> Ext = GSplatExtension;
   ENQUEUE_RENDER_COMMAND(ReconTwinSplatUpload)(
-      [Ext, Records = MoveTemp(Records), Nodes = MoveTemp(Nodes), TopCount, EnvCount, Capacity](
-          FRHICommandListImmediate &RHICmdList) mutable {
+      [Ext, Records = MoveTemp(Records), Cells = MoveTemp(Cells), LevelRanges = MoveTemp(LevelRanges), EnvCount,
+       Capacity](FRHICommandListImmediate &RHICmdList) mutable {
         TSharedPtr<FSplatResources, ESPMode::ThreadSafe> Res = MakeShared<FSplatResources, ESPMode::ThreadSafe>();
         Res->Count = Records.Num();
         Res->Capacity = Capacity;
         Res->EnvCount = EnvCount;
         Res->EnvFirst = Records.Num() - EnvCount;
-        Res->Nodes = MoveTemp(Nodes);
-        Res->TopCount = TopCount;
+        Res->Cells = MoveTemp(Cells);
+        Res->LevelRanges = MoveTemp(LevelRanges);
         for (uint32 First = 0; First < (uint32)Records.Num(); First += RecordsPerBuffer)
         {
           const uint32 Num = FMath::Min(RecordsPerBuffer, (uint32)Records.Num() - First);

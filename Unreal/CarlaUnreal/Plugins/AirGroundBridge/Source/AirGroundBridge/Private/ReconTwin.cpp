@@ -456,7 +456,7 @@ void LoadVisualLayer(UWorld *World, const TSharedPtr<FJsonObject> &Root, const F
   }
   const FVector Min = Splats.Bounds.Min, Max = Splats.Bounds.Max;
   UE_LOG(LogReconTwin, Display,
-         TEXT("ReconTwin splats: %s, %d splats in %d LOD nodes (%d listed, lod %d), up to %d per view, "
+         TEXT("ReconTwin splats: %s, %d splats in %d grid cells (%d listed, lod %d), up to %d per view, "
               "bounds [%.1f %.1f %.1f]..[%.1f %.1f %.1f] cm, %.1f s, mesh %s"),
          *File, Splats.Loaded, Splats.Nodes, Count, Lod, Splats.Capacity, Min.X, Min.Y, Min.Z, Max.X, Max.Y, Max.Z,
          Splats.Seconds, bKeepMesh ? TEXT("kept visible") : TEXT("hidden from RGB cameras and the spectator"));

@@ -6,17 +6,18 @@
 // §7 branch B).
 //
 // Input is an `.agsplat` pack from tools/make_twin_splats.py: a 64-byte header
-// ("AGSP", version 2, count, flags, bbox, env count, node count, top count),
-// a 48-byte node table (the scan's LOD tree, breadth first, children
-// contiguous: record range, child range, level, typical splat size, bbox) and
-// 32-byte records in the scan's grid frame (metres): float3 position, half4
-// quaternion (w x y z), half3 scale, uint8 rgba (display sRGB colour, linear
-// opacity), 2 bytes padding. Version 1 packs (no table) load as one node.
-// The scan's sky sphere comes last; -ReconTwinSplatsNoEnv drops it.
+// ("AGSP", version 3, count, flags, bbox, env count, cell count, range count),
+// a 32-byte cell table (uniform grid cells: range span, tight bbox), a 16-byte
+// range table (a cell's records at one level, finest first: record span,
+// level, typical splat size) and 32-byte records in the scan's grid frame
+// (metres): float3 position, half4 quaternion (w x y z), half3 scale, uint8
+// rgba (display sRGB colour, linear opacity), 2 bytes padding. Version 1
+// packs (no tables) load as one cell at one level. The scan's sky sphere
+// comes last; -ReconTwinSplatsNoEnv drops it.
 //
-// Per view the renderer walks the tree and keeps a node when its typical
-// splat projects to at most ag.Splat.LodPixels, so a region is drawn once at
-// the level its distance calls for, within ag.Splat.Budget splats.
+// Per view the renderer draws every cell in the frustum at the coarsest
+// level whose typical splat projects to at most ag.Splat.LodPixels, within
+// ag.Splat.Budget splats: level changes are never coarser than the grid.
 
 #pragma once
 
@@ -34,7 +35,7 @@ struct FGaussianSplatSummary
 {
   int32 InFile = 0;
   int32 Loaded = 0;
-  int32 Nodes = 0;    // LOD tree nodes (1 for a single-tier pack)
+  int32 Nodes = 0;    // grid cells (1 for a single-tier pack)
   int32 Capacity = 0; // splats sorted per view at most
   FBox Bounds = FBox(ForceInit); // UE world, cm
   double Seconds = 0.0;
