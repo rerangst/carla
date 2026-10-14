@@ -6,6 +6,8 @@
 #include "Dom/JsonObject.h"
 #include "Engine/DirectionalLight.h"
 #include "Engine/SkyLight.h"
+#include "Engine/StaticMesh.h"
+#include "Engine/StaticMeshActor.h"
 #include "EngineUtils.h"
 #include "Materials/MaterialInterface.h"
 #include "Misc/CommandLine.h"
@@ -57,7 +59,7 @@ static void EnsureLighting(UWorld *World)
     return;
   }
   ADirectionalLight *Sun = World->SpawnActor<ADirectionalLight>(
-      FVector::ZeroVector, FRotator(-50.0f, 35.0f, 0.0f));
+      FVector::ZeroVector, FRotator(-62.0f, 35.0f, 0.0f));
   if (Sun != nullptr)
   {
     Sun->SetMobility(EComponentMobility::Movable);
@@ -75,6 +77,7 @@ static void EnsureLighting(UWorld *World)
   {
     Sky->GetLightComponent()->SetMobility(EComponentMobility::Movable);
     Sky->GetLightComponent()->SetRealTimeCapture(true);
+    Sky->GetLightComponent()->SetIntensity(2.5f); // fill for the faces the sun misses
   }
   UE_LOG(LogReconTwin, Display, TEXT("ReconTwin: level had no light; added sun, sky light and atmosphere"));
 }
@@ -354,8 +357,10 @@ bool FReconTwinLoader::Load(UWorld *World, const FString &ManifestPath,
   EnsureLighting(World);
 
   // The visual layer's v0: per-vertex colours taken from the scan's splats
-  // (tools/make_twin_colors.py), shown through the engine's vertex-colour
-  // material. Absent colours leave the default grey; sensors never read either.
+  // (tools/make_twin_colors.py), shown through the engine's lit vertex-colour
+  // material. (The editor's colour-only view-mode material renders black in a
+  // game world, so an unlit look needs a material of our own later.) Absent
+  // colours leave the default grey; sensors never read either.
   UMaterialInterface *VertexColorMaterial = LoadObject<UMaterialInterface>(
       nullptr, TEXT("/Engine/EngineDebugMaterials/VertexColorMaterial.VertexColorMaterial"));
 
@@ -447,9 +452,31 @@ bool FReconTwinLoader::Load(UWorld *World, const FString &ManifestPath,
     Actor->Mesh->CreateMeshSection_LinearColor(
         0, Vertices, Ply.Indices, Normals, TArray<FVector2D>(),
         Colors, TArray<FProcMeshTangent>(), /*bCreateCollision=*/true);
+    // A scan is an open shell seen from either side; a second section with
+    // the winding reversed draws the back faces, which the single-sided
+    // material would otherwise cull into black holes. No collision on it:
+    // the triangles are the same ones.
+    TArray<int32> Reversed;
+    Reversed.SetNumUninitialized(Ply.Indices.Num());
+    for (int32 t = 0; t + 2 < Ply.Indices.Num(); t += 3)
+    {
+      Reversed[t] = Ply.Indices[t];
+      Reversed[t + 1] = Ply.Indices[t + 2];
+      Reversed[t + 2] = Ply.Indices[t + 1];
+    }
+    TArray<FVector> BackNormals;
+    BackNormals.SetNumUninitialized(Normals.Num());
+    for (int32 i = 0; i < Normals.Num(); ++i)
+    {
+      BackNormals[i] = -Normals[i];
+    }
+    Actor->Mesh->CreateMeshSection_LinearColor(
+        1, Vertices, Reversed, BackNormals, TArray<FVector2D>(),
+        Colors, TArray<FProcMeshTangent>(), /*bCreateCollision=*/false);
     if (Colors.Num() > 0 && VertexColorMaterial != nullptr)
     {
       Actor->Mesh->SetMaterial(0, VertexColorMaterial);
+      Actor->Mesh->SetMaterial(1, VertexColorMaterial);
     }
 
     // Spec §3 trap 2: one stencil serves both readers. PAS copies the root
@@ -468,6 +495,44 @@ bool FReconTwinLoader::Load(UWorld *World, const FString &ManifestPath,
     Summary.Tiles += 1;
     Summary.Vertices += Vertices.Num();
     Summary.Triangles += Ply.Indices.Num() / 3;
+  }
+
+  // A level with nothing but the twin shows black void around and under it.
+  // A plain ground plane below the lowest tile reads as terrain in pictures.
+  // No collision and no tag: sensors and the drone never know it is there.
+  if (Summary.Bounds.IsValid)
+  {
+    UStaticMesh *Plane = LoadObject<UStaticMesh>(nullptr, TEXT("/Engine/BasicShapes/Plane.Plane"));
+    if (Plane != nullptr)
+    {
+      const FVector Centre = Summary.Bounds.GetCenter();
+      // 2 m below the lowest vertex, in cm. Collision is switched off before
+      // the actor finishes spawning: done afterwards it did not take, and the
+      // lidar found a floor the twin never had.
+      const FTransform Where(FRotator::ZeroRotator,
+                             FVector(Centre.X, Centre.Y, Summary.Bounds.Min.Z - 200.0),
+                             FVector(20000.0, 20000.0, 1.0)); // the plane is 1 m: 20 km across
+      AStaticMeshActor *Ground = World->SpawnActorDeferred<AStaticMeshActor>(
+          AStaticMeshActor::StaticClass(), Where, nullptr, nullptr,
+          ESpawnActorCollisionHandlingMethod::AlwaysSpawn);
+      if (Ground != nullptr)
+      {
+        Ground->SetMobility(EComponentMobility::Movable);
+        UStaticMeshComponent *Comp = Ground->GetStaticMeshComponent();
+        Comp->SetStaticMesh(Plane);
+        Comp->SetCollisionProfileName(TEXT("NoCollision"));
+        Comp->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+        Comp->SetCollisionResponseToAllChannels(ECR_Ignore);
+        Comp->SetGenerateOverlapEvents(false);
+        Comp->SetRenderCustomDepth(false);
+        if (UMaterialInterface *Earth = LoadObject<UMaterialInterface>(
+                nullptr, TEXT("/Engine/EngineMaterials/DefaultMaterial.DefaultMaterial")))
+        {
+          Comp->SetMaterial(0, Earth);
+        }
+        Ground->FinishSpawning(Where);
+      }
+    }
   }
 
   Summary.Seconds = FPlatformTime::Seconds() - Started;
