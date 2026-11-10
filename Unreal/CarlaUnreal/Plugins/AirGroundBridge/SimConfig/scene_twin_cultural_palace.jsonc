@@ -16,20 +16,18 @@
       77.79
     ],
     "px4_params": {
-      "EKF2_MAG_TYPE": 1,
-      "EKF2_MAG_CHECK": 0,
-      "EKF2_DECL_TYPE": 1,
-      "EKF2_SYNT_MAG_Z": 1
+      "EKF2_DECL_TYPE": 0,
+      "EKF2_MAG_DECL": 1.157
     },
-    "px4_heading_bias_deg": 6.54,
+    "px4_heading_bias_deg": 0.0,
     "magnetic_field": {
       "sim_dipole": {
-        "north_g": 0.2998,
-        "east_g": -0.0522,
-        "down_g": -0.1379,
-        "strength_g": 0.334,
-        "declination_deg": -9.8691,
-        "inclination_deg": -24.3724
+        "north_g": 0.304,
+        "east_g": 0.0061,
+        "down_g": 0.1401,
+        "strength_g": 0.3348,
+        "declination_deg": 1.1575,
+        "inclination_deg": 24.7475
       },
       "igrf_2026": {
         "north_g": 0.376,
