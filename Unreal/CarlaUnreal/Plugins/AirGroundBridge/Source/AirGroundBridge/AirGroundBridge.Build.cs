@@ -18,6 +18,8 @@ public class AirGroundBridge : ModuleRules
             new string[] { "Carla", "ProjectAirSim", "RenderCore", "RHI",
                 // ReconTwin: twin.jsonc manifest + runtime collision tiles.
                 "Json", "ProceduralMeshComponent",
+                // ReconTwin: decodes a tile's orthophoto (JPEG/PNG) at load.
+                "ImageWrapper",
                 // GaussianSplatLayer: a scene view extension with its own
                 // global shaders (Renderer for FViewInfo and the post-process
                 // inputs, Projects to find the plugin's Shaders/ directory).

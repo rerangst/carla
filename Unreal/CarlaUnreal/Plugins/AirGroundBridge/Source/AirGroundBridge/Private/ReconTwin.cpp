@@ -11,14 +11,21 @@
 #include "Engine/SkyLight.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/StaticMeshActor.h"
+#include "Engine/Texture2D.h"
 #include "EngineUtils.h"
+#include "IImageWrapper.h"
+#include "IImageWrapperModule.h"
+#include "Materials/MaterialInstanceDynamic.h"
 #include "Materials/MaterialInterface.h"
+#include "Misc/App.h"
 #include "Misc/CommandLine.h"
 #include "Misc/FileHelper.h"
 #include "Misc/Paths.h"
+#include "Modules/ModuleManager.h"
 #include "ProceduralMeshComponent.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
+#include "TextureResource.h"
 
 #include "Carla/Game/Tagger.h"
 #include "Carla/Sensor/SceneCaptureCamera.h"
@@ -64,24 +71,56 @@ struct FGridToTrue
 
 /// CARLA's empty test level has no light at all; a twin loaded there would
 /// render black. Only added when the level brings none of its own.
-static void EnsureLighting(UWorld *World)
+///
+/// The manifest may say where the sun stood (visual.sun: azimuth_deg clockwise
+/// from true north, elevation_deg above the horizon): an orthophoto carries
+/// the shadows of its capture time, and a sim sun from another side would
+/// draw a second set pointing elsewhere. Returns the sun it placed from the
+/// manifest, so the caller can stretch its shadows over the loaded tiles.
+///
+/// With the sun from the manifest the sky light stays at its physical 1.0,
+/// so shadows keep their depth. -ReconTwinSunLux=<lux> and
+/// -ReconTwinSkyLight=<scale> override the two intensities: CARLA's cameras
+/// clamp auto-exposure to a narrow band, so how bright the twin renders
+/// follows the light put on it.
+static ADirectionalLight *EnsureLighting(UWorld *World, const TSharedPtr<FJsonObject> &Root)
 {
   for (TActorIterator<ADirectionalLight> It(World); It; ++It)
   {
     UE_LOG(LogReconTwin, Display, TEXT("ReconTwin: level lights itself (%s at %.0f lux)"),
            *It->GetName(), It->GetLightComponent()->Intensity);
-    return;
+    return nullptr;
   }
-  ADirectionalLight *Sun = World->SpawnActor<ADirectionalLight>(
-      FVector::ZeroVector, FRotator(-62.0f, 35.0f, 0.0f));
+  // Light travels away from the sun: pitch is minus the elevation, and with
+  // true north on +X and east on +Y the yaw is the azimuth turned around.
+  FRotator Direction(-62.0f, 35.0f, 0.0f);
+  bool bFromManifest = false;
+  const TSharedPtr<FJsonObject> *Visual = nullptr;
+  const TSharedPtr<FJsonObject> *SunInfo = nullptr;
+  double Azimuth = 0.0, Elevation = 0.0;
+  if (Root->TryGetObjectField(TEXT("visual"), Visual) &&
+      (*Visual)->TryGetObjectField(TEXT("sun"), SunInfo) &&
+      (*SunInfo)->TryGetNumberField(TEXT("azimuth_deg"), Azimuth) &&
+      (*SunInfo)->TryGetNumberField(TEXT("elevation_deg"), Elevation))
+  {
+    Direction = FRotator(-Elevation, Azimuth + 180.0, 0.0);
+    bFromManifest = true;
+    UE_LOG(LogReconTwin, Display, TEXT("ReconTwin: sun from the manifest, azimuth %.1f deg, elevation %.1f deg"),
+           Azimuth, Elevation);
+  }
+  // CARLA's cameras auto-expose within a bounded EV range, tuned for a real
+  // sun; UE's own SunSky uses 75000 lux, 2000 lux renders as dusk. The sky
+  // light at 2.5 fills the faces the sun misses on a bare scan mesh.
+  float SunLux = 75000.0f, SkyScale = bFromManifest ? 1.0f : 2.5f;
+  FParse::Value(FCommandLine::Get(), TEXT("ReconTwinSunLux="), SunLux);
+  FParse::Value(FCommandLine::Get(), TEXT("ReconTwinSkyLight="), SkyScale);
+  ADirectionalLight *Sun = World->SpawnActor<ADirectionalLight>(FVector::ZeroVector, Direction);
   if (Sun != nullptr)
   {
     Sun->SetMobility(EComponentMobility::Movable);
     if (UDirectionalLightComponent *Light = Cast<UDirectionalLightComponent>(Sun->GetLightComponent()))
     {
-      // CARLA's cameras auto-expose within a bounded EV range, tuned for a
-      // real sun; UE's own SunSky uses 75000 lux, 2000 lux renders as dusk.
-      Light->SetIntensity(75000.0f);
+      Light->SetIntensity(SunLux);
       Light->SetAtmosphereSunLight(true);
     }
   }
@@ -91,9 +130,12 @@ static void EnsureLighting(UWorld *World)
   {
     Sky->GetLightComponent()->SetMobility(EComponentMobility::Movable);
     Sky->GetLightComponent()->SetRealTimeCapture(true);
-    Sky->GetLightComponent()->SetIntensity(2.5f); // fill for the faces the sun misses
+    Sky->GetLightComponent()->SetIntensity(SkyScale);
   }
-  UE_LOG(LogReconTwin, Display, TEXT("ReconTwin: level had no light; added sun, sky light and atmosphere"));
+  UE_LOG(LogReconTwin, Display,
+         TEXT("ReconTwin: level had no light; added sun (%.0f lux), sky light (x%.2f) and atmosphere"),
+         SunLux, SkyScale);
+  return bFromManifest ? Sun : nullptr;
 }
 
 AReconTwinVisualCoordinator::AReconTwinVisualCoordinator()
@@ -464,6 +506,90 @@ void LoadVisualLayer(UWorld *World, const TSharedPtr<FJsonObject> &Root, const F
 
 } // namespace
 
+// ------------------------------------------------------------ orthophoto
+
+namespace
+{
+
+/// A tile's orthophoto as a texture with its full mip chain. Without mips a
+/// 10 cm texel seen from 100 m up shimmers; the chain is a plain 2x2 average
+/// of the stored (sRGB) bytes, slightly darker than averaging light itself
+/// and far cheaper, which is the right trade for ground seen from the air.
+UTexture2D *LoadOrthoTexture(const FString &Path, FString &Error)
+{
+  TArray64<uint8> Encoded;
+  if (!FFileHelper::LoadFileToArray(Encoded, *Path))
+  {
+    Error = TEXT("cannot read file");
+    return nullptr;
+  }
+  IImageWrapperModule &Images = FModuleManager::LoadModuleChecked<IImageWrapperModule>(TEXT("ImageWrapper"));
+  const EImageFormat Format = Images.DetectImageFormat(Encoded.GetData(), Encoded.Num());
+  const TSharedPtr<IImageWrapper> Image = Images.CreateImageWrapper(Format);
+  TArray64<uint8> Pixels;
+  if (!Image.IsValid() || !Image->SetCompressed(Encoded.GetData(), Encoded.Num()) ||
+      !Image->GetRaw(ERGBFormat::BGRA, 8, Pixels))
+  {
+    Error = TEXT("not an image this build can decode");
+    return nullptr;
+  }
+  int32 Width = static_cast<int32>(Image->GetWidth());
+  int32 Height = static_cast<int32>(Image->GetHeight());
+  if (!FMath::IsPowerOfTwo(Width) || !FMath::IsPowerOfTwo(Height))
+  {
+    Error = FString::Printf(TEXT("%dx%d is not a power of two on both sides"), Width, Height);
+    return nullptr;
+  }
+  UTexture2D *Texture = UTexture2D::CreateTransient(Width, Height, PF_B8G8R8A8);
+  if (Texture == nullptr)
+  {
+    Error = TEXT("could not create the texture");
+    return nullptr;
+  }
+  Texture->SRGB = true;
+  // Tiles meet edge to edge; wrapping would bleed the far side into each rim.
+  Texture->AddressX = TA_Clamp;
+  Texture->AddressY = TA_Clamp;
+  FTexturePlatformData *Data = Texture->GetPlatformData();
+  FMemory::Memcpy(Data->Mips[0].BulkData.Lock(LOCK_READ_WRITE), Pixels.GetData(), Pixels.Num());
+  Data->Mips[0].BulkData.Unlock();
+  while (Width > 1 || Height > 1)
+  {
+    const int32 NextWidth = FMath::Max(1, Width / 2), NextHeight = FMath::Max(1, Height / 2);
+    TArray64<uint8> Next;
+    Next.SetNumUninitialized(static_cast<int64>(NextWidth) * NextHeight * 4);
+    for (int32 Y = 0; Y < NextHeight; ++Y)
+    {
+      const int32 Y0 = FMath::Min(Y * 2, Height - 1), Y1 = FMath::Min(Y * 2 + 1, Height - 1);
+      for (int32 X = 0; X < NextWidth; ++X)
+      {
+        const int32 X0 = FMath::Min(X * 2, Width - 1), X1 = FMath::Min(X * 2 + 1, Width - 1);
+        const uint8 *A = &Pixels[(static_cast<int64>(Y0) * Width + X0) * 4];
+        const uint8 *B = &Pixels[(static_cast<int64>(Y0) * Width + X1) * 4];
+        const uint8 *C = &Pixels[(static_cast<int64>(Y1) * Width + X0) * 4];
+        const uint8 *D = &Pixels[(static_cast<int64>(Y1) * Width + X1) * 4];
+        uint8 *Out = &Next[(static_cast<int64>(Y) * NextWidth + X) * 4];
+        for (int32 Channel = 0; Channel < 4; ++Channel)
+        {
+          Out[Channel] = static_cast<uint8>((A[Channel] + B[Channel] + C[Channel] + D[Channel] + 2) / 4);
+        }
+      }
+    }
+    FTexture2DMipMap *Mip = new FTexture2DMipMap(NextWidth, NextHeight, 1);
+    Data->Mips.Add(Mip);
+    Mip->BulkData.Lock(LOCK_READ_WRITE);
+    FMemory::Memcpy(Mip->BulkData.Realloc(Next.Num()), Next.GetData(), Next.Num());
+    Mip->BulkData.Unlock();
+    Pixels = MoveTemp(Next);
+    Width = NextWidth;
+    Height = NextHeight;
+  }
+  Texture->UpdateResource();
+  return Texture;
+}
+
+} // namespace
+
 // --------------------------------------------------------------- loader
 
 bool FReconTwinLoader::Load(UWorld *World, const FString &ManifestPath,
@@ -513,7 +639,7 @@ bool FReconTwinLoader::Load(UWorld *World, const FString &ManifestPath,
            TEXT("ReconTwin: manifest has no geo.grid_to_true matrix; taking grid north as true north"));
   }
 
-  EnsureLighting(World);
+  ADirectionalLight *ManifestSun = EnsureLighting(World, Root);
 
   // The visual layer's v0: per-vertex colours taken from the scan's splats
   // (tools/make_twin_colors.py), shown through the engine's lit vertex-colour
@@ -522,6 +648,20 @@ bool FReconTwinLoader::Load(UWorld *World, const FString &ManifestPath,
   // colours leave the default grey; sensors never read either.
   UMaterialInterface *VertexColorMaterial = LoadObject<UMaterialInterface>(
       nullptr, TEXT("/Engine/EngineDebugMaterials/VertexColorMaterial.VertexColorMaterial"));
+  // The visual layer for surveyed terrain: an orthophoto per tile
+  // (collision.tiles[].texture) through the plugin's own lit, matte, two-sided
+  // material (tools/make_twin_material.py writes the asset). Nothing to draw
+  // on without a renderer, and no reason to hold gigabytes of pixels there.
+  UMaterialInterface *OrthoMaterial = FApp::CanEverRender()
+      ? LoadObject<UMaterialInterface>(nullptr, TEXT("/AirGroundBridge/Twin/M_TwinOrtho.M_TwinOrtho"))
+      : nullptr;
+  // A photo of sunlit ground is brighter than the ground's reflectance; lit
+  // again at face value it renders washed out. The gain brings the base
+  // colour down to where the sim's sun gives back the photo's own tone.
+  float OrthoGain = 0.4f;
+  FParse::Value(FCommandLine::Get(), TEXT("ReconTwinOrthoGain="), OrthoGain);
+  int32 TexturedTiles = 0;
+  bool bToldAboutMaterial = false;
 
   const FString BaseDir = FPaths::GetPath(ManifestPath);
   TArray<AReconTwinTile *> TileActors;
@@ -588,9 +728,52 @@ bool FReconTwinLoader::Load(UWorld *World, const FString &ManifestPath,
       UE_LOG(LogReconTwin, Error, TEXT("ReconTwin: could not spawn tile %s"), *File);
       return false;
     }
+    // The photo covers extent_m = [xmin, ymin, xmax, ymax] in the PLY's own
+    // coordinates, row 0 at ymax (north), so a vertex's UV is its position.
+    UTexture2D *Ortho = nullptr;
+    TArray<FVector2D> UVs;
+    const TSharedPtr<FJsonObject> *TextureInfo = nullptr;
+    const TArray<TSharedPtr<FJsonValue>> *Extent = nullptr;
+    FString TextureFile;
+    if (FApp::CanEverRender() && Tile->TryGetObjectField(TEXT("texture"), TextureInfo) &&
+        (*TextureInfo)->TryGetStringField(TEXT("file"), TextureFile) &&
+        (*TextureInfo)->TryGetArrayField(TEXT("extent_m"), Extent) && Extent->Num() == 4)
+    {
+      const double XMin = (*Extent)[0]->AsNumber(), YMin = (*Extent)[1]->AsNumber();
+      const double XMax = (*Extent)[2]->AsNumber(), YMax = (*Extent)[3]->AsNumber();
+      FString TextureError;
+      if (OrthoMaterial == nullptr)
+      {
+        if (!bToldAboutMaterial)
+        {
+          UE_LOG(LogReconTwin, Warning,
+                 TEXT("ReconTwin: tiles carry orthophotos but /AirGroundBridge/Twin/M_TwinOrtho is missing "
+                      "(tools/make_twin_material.py); showing vertex colours"));
+          bToldAboutMaterial = true;
+        }
+      }
+      else if (XMax <= XMin || YMax <= YMin)
+      {
+        UE_LOG(LogReconTwin, Warning, TEXT("ReconTwin: %s: empty extent_m"), *TextureFile);
+      }
+      else if ((Ortho = LoadOrthoTexture(FPaths::Combine(BaseDir, TextureFile), TextureError)) == nullptr)
+      {
+        UE_LOG(LogReconTwin, Warning, TEXT("ReconTwin: %s: %s; showing vertex colours"), *TextureFile, *TextureError);
+      }
+      else
+      {
+        UVs.SetNumUninitialized(Ply.Positions.Num());
+        for (int32 i = 0; i < Ply.Positions.Num(); ++i)
+        {
+          UVs[i] = FVector2D((Ply.Positions[i].X - XMin) / (XMax - XMin),
+                             (YMax - Ply.Positions[i].Y) / (YMax - YMin));
+        }
+      }
+    }
+
     TArray<FLinearColor> Colors;
     FString ColorFile;
-    if (Tile->TryGetStringField(TEXT("colors"), ColorFile))
+    if (Ortho == nullptr && Tile->TryGetStringField(TEXT("colors"), ColorFile))
     {
       TArray<uint8> Bytes;
       if (FFileHelper::LoadFileToArray(Bytes, *FPaths::Combine(BaseDir, ColorFile)) &&
@@ -610,33 +793,45 @@ bool FReconTwinLoader::Load(UWorld *World, const FString &ManifestPath,
       }
     }
     Actor->Mesh->CreateMeshSection_LinearColor(
-        0, Vertices, Ply.Indices, Normals, TArray<FVector2D>(),
+        0, Vertices, Ply.Indices, Normals, UVs,
         Colors, TArray<FProcMeshTangent>(), /*bCreateCollision=*/true);
+    if (Ortho != nullptr)
+    {
+      UMaterialInstanceDynamic *Skin = UMaterialInstanceDynamic::Create(OrthoMaterial, Actor);
+      Skin->SetTextureParameterValue(TEXT("Ortho"), Ortho);
+      Skin->SetScalarParameterValue(TEXT("Gain"), OrthoGain);
+      Actor->Mesh->SetMaterial(0, Skin);
+      ++TexturedTiles;
+    }
     // A scan is an open shell seen from either side; a second section with
     // the winding reversed draws the back faces, which the single-sided
     // material would otherwise cull into black holes. No collision on it:
-    // the triangles are the same ones.
+    // the triangles are the same ones. The orthophoto material is two-sided
+    // and needs none of this.
     TArray<int32> Reversed;
-    Reversed.SetNumUninitialized(Ply.Indices.Num());
-    for (int32 t = 0; t + 2 < Ply.Indices.Num(); t += 3)
+    if (Ortho == nullptr)
     {
-      Reversed[t] = Ply.Indices[t];
-      Reversed[t + 1] = Ply.Indices[t + 2];
-      Reversed[t + 2] = Ply.Indices[t + 1];
-    }
-    TArray<FVector> BackNormals;
-    BackNormals.SetNumUninitialized(Normals.Num());
-    for (int32 i = 0; i < Normals.Num(); ++i)
-    {
-      BackNormals[i] = -Normals[i];
-    }
-    Actor->Mesh->CreateMeshSection_LinearColor(
-        1, Vertices, Reversed, BackNormals, TArray<FVector2D>(),
-        Colors, TArray<FProcMeshTangent>(), /*bCreateCollision=*/false);
-    if (Colors.Num() > 0 && VertexColorMaterial != nullptr)
-    {
-      Actor->Mesh->SetMaterial(0, VertexColorMaterial);
-      Actor->Mesh->SetMaterial(1, VertexColorMaterial);
+      Reversed.SetNumUninitialized(Ply.Indices.Num());
+      for (int32 t = 0; t + 2 < Ply.Indices.Num(); t += 3)
+      {
+        Reversed[t] = Ply.Indices[t];
+        Reversed[t + 1] = Ply.Indices[t + 2];
+        Reversed[t + 2] = Ply.Indices[t + 1];
+      }
+      TArray<FVector> BackNormals;
+      BackNormals.SetNumUninitialized(Normals.Num());
+      for (int32 i = 0; i < Normals.Num(); ++i)
+      {
+        BackNormals[i] = -Normals[i];
+      }
+      Actor->Mesh->CreateMeshSection_LinearColor(
+          1, Vertices, Reversed, BackNormals, TArray<FVector2D>(),
+          Colors, TArray<FProcMeshTangent>(), /*bCreateCollision=*/false);
+      if (Colors.Num() > 0 && VertexColorMaterial != nullptr)
+      {
+        Actor->Mesh->SetMaterial(0, VertexColorMaterial);
+        Actor->Mesh->SetMaterial(1, VertexColorMaterial);
+      }
     }
 
     // Spec §3 trap 2: one stencil serves both readers. PAS copies the root
@@ -695,6 +890,25 @@ bool FReconTwinLoader::Load(UWorld *World, const FString &ManifestPath,
         Ground->FinishSpawning(Where);
       }
     }
+  }
+
+  // The default cascades stop 200 m from the camera, which from the air is
+  // no shadow at all; a sun the manifest placed is there to model the
+  // terrain, so its shadows reach across the twin.
+  if (ManifestSun != nullptr && Summary.Bounds.IsValid)
+  {
+    if (UDirectionalLightComponent *Light = Cast<UDirectionalLightComponent>(ManifestSun->GetLightComponent()))
+    {
+      Light->SetDynamicShadowDistanceMovableLight(
+          static_cast<float>(FMath::Min(Summary.Bounds.GetSize().Size2D(), 500000.0)));
+      Light->SetDynamicShadowCascades(4);
+      Light->SetCascadeDistributionExponent(3.0f);
+    }
+  }
+  if (TexturedTiles > 0)
+  {
+    UE_LOG(LogReconTwin, Display, TEXT("ReconTwin: %d of %d tiles wear their orthophoto, gain %.2f"),
+           TexturedTiles, TileActors.Num(), OrthoGain);
   }
 
   LoadVisualLayer(World, Root, BaseDir, Frame, OriginCm, TileActors, Ground, Summary);

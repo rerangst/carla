@@ -7,7 +7,7 @@
   "Category": "Simulation",
   "CreatedBy": "AirGround Sim project",
   "EnabledByDefault": true,
-  "CanContainContent": false,
+  "CanContainContent": true,
   "Installed": true,
   "Modules": [
     {
